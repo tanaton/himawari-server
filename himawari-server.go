@@ -124,7 +124,7 @@ func init() {
 		log.Fatal(err)
 	}
 	log.SetFormatter(&log.TextFormatter{})
-	log.SetLevel(log.WarnLevel)
+	log.SetLevel(log.InfoLevel)
 }
 
 func main() {
