@@ -592,7 +592,7 @@ func NewTask(it os.FileInfo) *Task {
 	t.rp = filepath.Join(RAW_PATH, t.Name)
 	t.dp = filepath.Join(DELETE_PATH, t.Name)
 	t.ep = filepath.Join(title_path, enc_name)
-	t.tp = filepath.Join(THUMBNAIL_PATH, category_path, t.Title, t.Subtitle)
+	t.tp = filepath.Join(THUMBNAIL_PATH, t.Category, t.Title, t.Subtitle)
 	if isExist(t.ep) {
 		// エンコード後ファイルが存在するのでスキップ
 		return nil
