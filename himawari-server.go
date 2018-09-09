@@ -31,8 +31,7 @@ const (
 	RAW_PATH       = "/data/video/tmp"
 	DELETE_PATH    = "/data/video/del"
 	ENCODED_PATH   = "/data/public/video"
-	ENCODING_PATH  = "/data/public/encoding"
-	THUMBNAIL_PATH = "./public_html/thumbnail"
+	THUMBNAIL_PATH = "/data/public/thumbnail"
 
 	WORKER_CHECK_DURATION     = time.Hour
 	WORKER_DELETE_DURATION    = time.Hour * 24
@@ -544,7 +543,7 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 			log.WithFields(log.Fields{
 				"encoded_path":   t.ep,
 				"thumbnail_path": t.tp,
-				"count":          count,
+				"count":          int(count),
 			}).Info("サムネイル作成完了")
 		}
 	}
