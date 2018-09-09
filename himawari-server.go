@@ -530,22 +530,16 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 			// フォルダ作成に失敗
 			continue
 		}
-		count := t.d / THUMBNAIL_INTERVAL_DURATION
-		var i time.Duration
-		for i = 0; i <= count; i++ {
-			err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
-			if err != nil {
-				log.Warn(err)
-				break
-			}
+		err := createMovieThumbnail(t.ep, t.tp, THUMBNAIL_INTERVAL_DURATION)
+		if err != nil {
+			log.Warn(err)
+			continue
 		}
-		if i > count {
-			log.WithFields(log.Fields{
-				"encoded_path":   t.ep,
-				"thumbnail_path": t.tp,
-				"count":          int(count),
-			}).Info("サムネイル作成完了")
-		}
+		log.WithFields(log.Fields{
+			"encoded_path":   t.ep,
+			"thumbnail_path": t.tp,
+			"duration":       t.d,
+		}).Info("サムネイル作成完了")
 	}
 }
 
@@ -723,17 +717,14 @@ func getMovieDuration(p string) time.Duration {
 	return d
 }
 
-func createMovieThumbnail(ep, tp string, dur time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+func createMovieThumbnail(ep, tp string, interval time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 	defer cancel()
 	// ffmpegもffprobeもstderrに出力するのでffmpegを使っておく
 	args := []string{
-		"-ss", strconv.FormatInt(int64(dur/time.Second), 10),
 		"-i", ep,
-		"-vframes", "1",
-		"-f", "image2",
-		"-vf", "scale=320:-1",
-		filepath.Join(tp, fmt.Sprintf("%06d.jpg", dur/time.Second)),
+		"-vf", fmt.Sprintf("fps=1/%d,scale=320:-1", interval/time.Second),
+		filepath.Join(tp, `%06d.jpg`),
 	}
 	return exec.CommandContext(ctx, "ffmpeg", args...).Run()
 }
