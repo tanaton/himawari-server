@@ -117,13 +117,14 @@ var regFilename = regexp.MustCompile(`^\[(\d{6}-\d{4})\]\[([^\]]+)\]\[([^\]]+)\]
 var serverIP string
 
 func init() {
+	log.SetFormatter(&log.TextFormatter{})
+	log.SetLevel(log.InfoLevel)
+
 	var err error
 	serverIP, err = externalIP()
 	if err != nil {
-		log.Fatal(err)
+		log.WithError(err).Fatal("自身のIPアドレスの取得に失敗しました。")
 	}
-	log.SetFormatter(&log.TextFormatter{})
-	log.SetLevel(log.InfoLevel)
 }
 
 func main() {
@@ -132,7 +133,7 @@ func main() {
 		Addr:    fmt.Sprintf(":%d", HTTP_PORT),
 		Handler: hh,
 	}
-	log.Fatal(h.ListenAndServe())
+	log.WithError(h.ListenAndServe()).Fatal("サーバが停止しました。")
 }
 
 func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -283,7 +284,7 @@ func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 	tmpl := template.Must(template.ParseFiles(filepath.Join(HTTP_DIR, "index.html")))
 	if err := tmpl.ExecuteTemplate(w, "index.html", db); err != nil {
-		log.Warn(err)
+		log.WithError(err).Warn("index.htmlの生成に失敗しました。")
 	}
 }
 
@@ -418,7 +419,7 @@ func NewHimawari() *himawariHandle {
 	hh.completed.data = make([]Worker, 0, 16)
 	dir, err := ioutil.ReadDir(RAW_PATH)
 	if err != nil {
-		log.Warn(err)
+		log.WithError(err).Warn("RAW_PATHの読み込みに失敗しました。")
 		return nil
 	}
 	for _, it := range dir {
@@ -535,7 +536,13 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 		for i = 0; i <= count; i++ {
 			err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
 			if err != nil {
-				log.Warn(err)
+				log.WithFields(log.Fields{
+					"encoded_path":   t.ep,
+					"thumbnail_path": t.tp,
+					"duration":       t.d,
+					"index":          int(i),
+					"error":          err,
+				}).Warn("サムネイルの作成に失敗しました。")
 				break
 			}
 		}
@@ -572,7 +579,10 @@ func NewTask(it os.FileInfo) *Task {
 	category_path := filepath.Join(ENCODED_PATH, t.Category)
 	cerr := os.MkdirAll(category_path, 0755)
 	if cerr != nil {
-		log.Warn(cerr)
+		log.WithFields(log.Fields{
+			"name":  t.Name,
+			"error": cerr,
+		}).Warn("カテゴリフォルダ作成に失敗しました。")
 		return nil
 	}
 
@@ -583,7 +593,10 @@ func NewTask(it os.FileInfo) *Task {
 	title_path := filepath.Join(category_path, t.Title)
 	terr := os.MkdirAll(title_path, 0755)
 	if terr != nil {
-		log.Warn(terr)
+		log.WithFields(log.Fields{
+			"name":  t.Name,
+			"error": terr,
+		}).Warn("作品フォルダ作成に失敗しました。")
 		return nil
 	}
 	// 同じ名前ならエンコードを省略
@@ -602,6 +615,11 @@ func NewTask(it os.FileInfo) *Task {
 	t.tp = filepath.Join(THUMBNAIL_PATH, t.Category, t.Title, t.Subtitle)
 	if isExist(t.ep) {
 		// エンコード後ファイルが存在するのでスキップ
+		log.WithFields(log.Fields{
+			"size":     t.Size,
+			"name":     t.Name,
+			"raw_path": t.rp,
+		}).Info("すでにエンコードされている作品のようです。")
 		return nil
 	}
 	log.WithFields(log.Fields{
