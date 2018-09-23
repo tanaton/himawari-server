@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	HTTP_PORT      = 1029
+	HTTP_PORT      = 10616
 	HTTP_DIR       = "./public_html"
 	RAW_PATH       = "/data/video/tmp"
 	DELETE_PATH    = "/data/video/del"
