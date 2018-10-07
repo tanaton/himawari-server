@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -159,6 +160,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "GET以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+			log.WithFields(log.Fields{
+				"path":   r.URL.Path,
+				"method": r.Method,
+			}).Info("対応していないメソッドです。")
 		}
 	} else if p == "/task" {
 		// お仕事
@@ -196,21 +201,49 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						"-maxrate", "2000k",
 					},
 				}
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.Header().Set("X-Content-Type-Options", "nosniff")
-				w.WriteHeader(http.StatusOK)
-
-				err := json.NewEncoder(w).Encode(&tt)
-				if err != nil {
+				buf := bytes.Buffer{}
+				err := json.NewEncoder(&buf).Encode(&tt)
+				if err == nil {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					w.Header().Set("X-Content-Type-Options", "nosniff")
+					w.WriteHeader(http.StatusOK)
+					n, err := buf.WriteTo(w)
+					if err != nil {
+						log.WithFields(log.Fields{
+							"path": r.URL.Path,
+							"size": tt.Size,
+							"name": tt.Name,
+						}).Info("お仕事の転送に失敗しました。", err)
+					} else {
+						log.WithFields(log.Fields{
+							"path": r.URL.Path,
+							"send": n,
+						}).Info("お仕事の転送に成功しました。")
+					}
+				} else {
 					// お仕事やり直し
 					hh.workerToTask(t.Id)
+					http.Error(w, "お仕事のjsonエンコードに失敗しました。", http.StatusInternalServerError)
+					log.WithFields(log.Fields{
+						"path": r.URL.Path,
+						"size": tt.Size,
+						"name": tt.Name,
+					}).Info("お仕事のjsonエンコードに失敗しました。", err)
 				}
 			} else {
 				// お仕事はない
 				http.NotFound(w, r)
+				log.WithFields(log.Fields{
+					"path":   r.URL.Path,
+					"method": r.Method,
+				}).Info("仕事がありません。")
 			}
 		default:
 			http.Error(w, "GET、POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+			log.WithFields(log.Fields{
+				"path":   r.URL.Path,
+				"method": r.Method,
+			}).Info("対応していないメソッドです。")
 		}
 	} else if p == "/task/add" {
 		// お仕事を追加する
@@ -232,6 +265,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+			log.WithFields(log.Fields{
+				"path":   r.URL.Path,
+				"method": r.Method,
+			}).Info("対応していないメソッドです。")
 		}
 	} else if p == "/task/done" {
 		// お仕事完了
@@ -248,6 +285,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+			log.WithFields(log.Fields{
+				"path":   r.URL.Path,
+				"method": r.Method,
+			}).Info("対応していないメソッドです。")
 		}
 	} else if strings.Index(p, "/task/id/") == 0 {
 		// 実装は後で
