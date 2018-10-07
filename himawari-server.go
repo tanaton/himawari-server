@@ -323,7 +323,18 @@ func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
 		Worker:    wo,
 		Completed: c,
 	}
-	tmpl := template.Must(template.ParseFiles(filepath.Join(HTTP_DIR, "index.html")))
+	tmpl := template.New("t")
+	tmpl.Funcs(template.FuncMap{
+		"ShortByte": func(s int64) (ret string) {
+			if s > 1000*1000*1000 {
+				ret = fmt.Sprintf("%.2fGB", float64(s)/(1000*1000*1000))
+			} else {
+				ret = fmt.Sprintf("%.2fMB", float64(s)/(1000*1000))
+			}
+			return
+		},
+	})
+	template.Must(tmpl.ParseFiles(filepath.Join(HTTP_DIR, "index.html")))
 	if err := tmpl.ExecuteTemplate(w, "index.html", db); err != nil {
 		log.WithError(err).Warn("index.htmlの生成に失敗しました。")
 	}

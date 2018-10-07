@@ -130,7 +130,7 @@
 								<td>{{$it.Host}}</td>
 								<td>{{$it.Start.Format "2006/1/2 15:04:05"}}</td>
 								<td>{{$it.Task.Name}}</td>
-								<td>{{$it.Task.Size}}</td>
+								<td>{{ShortByte $it.Task.Size}}</td>
 							</tr>
 							{{end -}}
 						</tbody>
@@ -152,7 +152,7 @@
 							<tr>
 								<td>{{$it.Id}}</td>
 								<td>{{$it.Name}}</td>
-								<td>{{$it.Size}}</td>
+								<td>{{ShortByte $it.Size}}</td>
 							</tr>
 							{{end}}
 						</tbody>
