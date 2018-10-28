@@ -461,10 +461,16 @@ func NewHimawari() *himawariHandle {
 			data := make([]*Task, 0, 16)
 			var datacopy []*Task
 			var popcw chan<- *Task
+			datahead := func() *Task {
+				if len(data) > 0 {
+					return data[0]
+				}
+				return nil
+			}
 			for {
 				select {
 				case allc <- datacopy:
-				case popcw <- data[0]:
+				case popcw <- datahead():
 					data = data[1:]
 					if len(data) <= 0 {
 						popcw = nil
