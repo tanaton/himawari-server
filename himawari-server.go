@@ -17,7 +17,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 
@@ -91,22 +90,31 @@ type Thumbnail struct {
 	ep string
 	tp string
 }
+type himawariTask struct {
+	all <-chan []*Task
+	pop <-chan *Task
+	add chan<- *Task
+}
+type himawariWorkerAddItem struct {
+	id string
+	w  Worker
+}
+type himawariWorker struct {
+	all <-chan map[string]Worker
+	add chan<- himawariWorkerAddItem
+	del chan<- string
+}
+type himawariComplete struct {
+	all <-chan []Worker
+	add chan<- Worker
+}
 
 type himawariHandle struct {
-	file   http.Handler
-	thumbc chan<- Thumbnail
-	tasks  struct {
-		sync.RWMutex
-		data []*Task
-	}
-	worker struct {
-		sync.RWMutex
-		data map[string]Worker
-	}
-	completed struct {
-		sync.RWMutex
-		data []Worker
-	}
+	file      http.Handler
+	thumbc    chan<- Thumbnail
+	tasks     himawariTask
+	worker    himawariWorker
+	completed himawariComplete
 }
 type Dashboard struct {
 	Tasks     []*Task
@@ -142,9 +150,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Index(p, "/video/id/") == 0 {
 		if r.Method == "GET" {
 			id := p[10:]
-			hh.worker.RLock()
-			wo, ok := hh.worker.data[id]
-			hh.worker.RUnlock()
+			wo, ok := (<-hh.worker.all)[id]
 			if ok {
 				rfp, err := os.Open(wo.Task.rp)
 				if err != nil {
@@ -253,9 +259,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				t := NewTask(stat)
 				if t != nil {
 					// 追加
-					hh.tasks.Lock()
-					hh.tasks.data = append(hh.tasks.data, t)
-					hh.tasks.Unlock()
+					hh.tasks.add <- t
 				} else {
 					// 失敗しても特にエラーではない
 				}
@@ -303,25 +307,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
-	hh.tasks.RLock()
-	hh.worker.RLock()
-	hh.completed.RLock()
-	t := make([]*Task, len(hh.tasks.data))
-	copy(t, hh.tasks.data)
-	wo := make(map[string]Worker)
-	for k, v := range hh.worker.data {
-		wo[k] = v
-	}
-	c := make([]Worker, len(hh.completed.data))
-	copy(c, hh.completed.data)
-	hh.tasks.RUnlock()
-	hh.worker.RUnlock()
-	hh.completed.RUnlock()
-
 	db := Dashboard{
-		Tasks:     t,
-		Worker:    wo,
-		Completed: c,
+		Tasks:     <-hh.tasks.all,
+		Worker:    <-hh.worker.all,
+		Completed: <-hh.completed.all,
 	}
 	tmpl := template.New("t")
 	tmpl.Funcs(template.FuncMap{
@@ -343,9 +332,7 @@ func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
 func (hh *himawariHandle) done(r *http.Request) error {
 	id := r.PostFormValue("uuid")
 
-	hh.worker.RLock()
-	wo, ok := hh.worker.data[id]
-	hh.worker.RUnlock()
+	wo, ok := (<-hh.worker.all)[id]
 	if ok {
 		err := readPostFile(r, wo.Task.ep)
 		if err != nil {
@@ -384,13 +371,9 @@ func (hh *himawariHandle) done(r *http.Request) error {
 		wo.End = time.Now()
 
 		// お仕事完了
-		hh.worker.Lock()
-		delete(hh.worker.data, id)
-		hh.worker.Unlock()
+		hh.worker.del <- id
 		// お仕事完了リストに追加
-		hh.completed.Lock()
-		hh.completed.data = append(hh.completed.data, wo)
-		hh.completed.Unlock()
+		hh.completed.add <- wo
 		log.WithFields(log.Fields{
 			"size":  wo.Task.Size,
 			"name":  wo.Task.Name,
@@ -420,43 +403,41 @@ func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
 		Start: time.Now(),
 	}
 	var t *Task
-	hh.tasks.Lock()
-	hh.worker.Lock()
-	if len(hh.tasks.data) > 0 {
-		t = hh.tasks.data[0]
-		hh.tasks.data = hh.tasks.data[1:]
+	select {
+	case t = <-hh.tasks.pop:
 		wo.Task = t
-		hh.worker.data[t.Id] = wo
+		hh.worker.add <- himawariWorkerAddItem{
+			id: t.Id,
+			w:  wo,
+		}
 		log.WithFields(log.Fields{
 			"size":  wo.Task.Size,
 			"name":  wo.Task.Name,
 			"host":  wo.Host,
 			"start": wo.Start,
 		}).Info("お仕事が開始されました。")
+	default:
+		// 次の仕事なし
 	}
-	hh.worker.Unlock()
-	hh.tasks.Unlock()
 	return t
 }
 
-func (hh *himawariHandle) workerToTask(id string) {
-	hh.tasks.Lock()
-	hh.worker.Lock()
-	wo, ok := hh.worker.data[id]
-	if ok {
-		// 新しいUUIDにする
-		wo.Task.Id = NewUUID()
-		hh.tasks.data = append(hh.tasks.data, wo.Task)
-		delete(hh.worker.data, id)
-
-		log.WithFields(log.Fields{
-			"size":  wo.Task.Size,
-			"name":  wo.Task.Name,
-			"start": wo.Start,
-		}).Info("仕事をタスクリストに戻しました。")
+func (hh *himawariHandle) workerToTask(idlist ...string) {
+	worker := <-hh.worker.all
+	for _, id := range idlist {
+		wo, ok := worker[id]
+		if ok {
+			// 新しいUUIDにする
+			wo.Task.Id = NewUUID()
+			hh.worker.del <- id
+			hh.tasks.add <- wo.Task
+			log.WithFields(log.Fields{
+				"size":  wo.Task.Size,
+				"name":  wo.Task.Name,
+				"start": wo.Start,
+			}).Info("仕事をタスクリストに戻しました。")
+		}
 	}
-	hh.worker.Unlock()
-	hh.tasks.Unlock()
 }
 
 func NewUUID() string {
@@ -464,64 +445,129 @@ func NewUUID() string {
 }
 
 func NewHimawari() *himawariHandle {
-	hh := &himawariHandle{}
-	hh.file = http.FileServer(http.Dir(HTTP_DIR))
-	hh.tasks.data = make([]*Task, 0, 16)
-	hh.worker.data = make(map[string]Worker)
-	hh.completed.data = make([]Worker, 0, 16)
 	dir, err := ioutil.ReadDir(RAW_PATH)
 	if err != nil {
 		log.WithError(err).Warn("RAW_PATHの読み込みに失敗しました。")
 		return nil
 	}
+
+	hh := &himawariHandle{}
+	hh.file = http.FileServer(http.Dir(HTTP_DIR))
+	hh.tasks = func() himawariTask {
+		allc := make(chan []*Task)
+		popc := make(chan *Task)
+		addc := make(chan *Task, 4)
+		go func() {
+			data := make([]*Task, 0, 16)
+			var datacopy []*Task
+			var popcw chan<- *Task
+			for {
+				select {
+				case allc <- datacopy:
+				case popcw <- data[0]:
+					data = data[1:]
+					if len(data) <= 0 {
+						popcw = nil
+					}
+				case t := <-addc:
+					data = append(data, t)
+					popcw = popc
+				}
+				datacopy = make([]*Task, len(data))
+				copy(datacopy, data)
+			}
+		}()
+		return himawariTask{
+			all: allc,
+			pop: popc,
+			add: addc,
+		}
+	}()
+	hh.worker = func() himawariWorker {
+		allc := make(chan map[string]Worker)
+		delc := make(chan string, 4)
+		addc := make(chan himawariWorkerAddItem, 4)
+		go func() {
+			tic := time.NewTicker(WORKER_CHECK_DURATION)
+			data := make(map[string]Worker)
+			var datacopy map[string]Worker
+			for {
+				select {
+				case allc <- datacopy:
+				case id := <-delc:
+					delete(data, id)
+				case item := <-addc:
+					data[item.id] = item.w
+				case now := <-tic.C:
+					idlist := []string{}
+					for key, it := range data {
+						if now.After(it.Start.Add(WORKER_DELETE_DURATION)) {
+							idlist = append(idlist, key)
+						}
+					}
+					// goroutine使わないとデッドロックする
+					go hh.workerToTask(idlist...)
+				}
+				datacopy = make(map[string]Worker)
+				for k, v := range data {
+					datacopy[k] = v
+				}
+			}
+		}()
+		return himawariWorker{
+			all: allc,
+			add: addc,
+			del: delc,
+		}
+	}()
+	hh.completed = func() himawariComplete {
+		allc := make(chan []Worker)
+		addc := make(chan Worker)
+		go func() {
+			tic := time.NewTicker(WORKER_CHECK_DURATION)
+			data := make([]Worker, 0, 16)
+			var datacopy []Worker
+			for {
+				select {
+				case allc <- datacopy:
+				case w := <-addc:
+					data = append(data, w)
+				case now := <-tic.C:
+					var i int
+					for i = len(data) - 1; i >= 0; i-- {
+						if now.After(data[i].End.Add(COMPLETED_DELETE_DURATION)) {
+							break
+						}
+					}
+					if i >= 0 {
+						data = data[i+1:]
+						log.WithFields(log.Fields{
+							"count": i,
+						}).Info("完了リストの定期清掃を実施しました。")
+					}
+				}
+				datacopy = make([]Worker, len(data))
+				copy(datacopy, data)
+			}
+		}()
+		return himawariComplete{
+			all: allc,
+			add: addc,
+		}
+	}()
+
 	for _, it := range dir {
 		t := NewTask(it)
 		if t != nil {
-			hh.tasks.data = append(hh.tasks.data, t)
+			hh.tasks.add <- t
 		}
 	}
 	thumbChan := make(chan Thumbnail, 256)
 	hh.thumbc = thumbChan
-	go hh.cycle()
 	go thumbnailcycle(thumbChan)
 	go thumbnailstart(thumbChan)
-	return hh
-}
 
-func (hh *himawariHandle) cycle() {
-	tic := time.NewTicker(WORKER_CHECK_DURATION)
-	for now := range tic.C {
-		{
-			idlist := []string{}
-			hh.worker.RLock()
-			for key, it := range hh.worker.data {
-				if now.After(it.Start.Add(WORKER_DELETE_DURATION)) {
-					idlist = append(idlist, key)
-				}
-			}
-			hh.worker.RUnlock()
-			for _, id := range idlist {
-				hh.workerToTask(id)
-			}
-		}
-		{
-			hh.completed.Lock()
-			var i int
-			for i = len(hh.completed.data) - 1; i >= 0; i-- {
-				it := hh.completed.data[i]
-				if now.After(it.End.Add(COMPLETED_DELETE_DURATION)) {
-					break
-				}
-			}
-			if i >= 0 {
-				hh.completed.data = hh.completed.data[i+1:]
-				log.WithFields(log.Fields{
-					"count": i,
-				}).Info("完了リストの定期清掃を実施しました。")
-			}
-			hh.completed.Unlock()
-		}
-	}
+	return hh
 }
 
 func thumbnailstart(tc chan<- Thumbnail) {
