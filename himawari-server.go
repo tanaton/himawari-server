@@ -38,7 +38,7 @@ const (
 	COMPLETED_DELETE_DURATION = time.Hour * 24 * 7
 
 	PRESET_NAME                 = "libx265-hq-ts.ffpreset"
-	ENCODE_THREADS              = 12
+	ENCODE_THREADS              = 2
 	THUMBNAIL_INTERVAL_DURATION = time.Second * 10
 )
 
