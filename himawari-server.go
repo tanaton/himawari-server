@@ -204,6 +204,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						"-s", "1280x720",
 						"-vsync", "1",
 						"-deinterlace",
+						"-pix_fmt", "yuv420p"
 						"-f", "mp4",
 						"-bufsize", "200000k",
 						"-maxrate", "2000k",
