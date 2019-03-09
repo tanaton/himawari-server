@@ -204,7 +204,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 						"-s", "1280x720",
 						"-vsync", "1",
 						"-deinterlace",
-						"-pix_fmt", "yuv420p"
+						"-pix_fmt", "yuv420p",
 						"-f", "mp4",
 						"-bufsize", "200000k",
 						"-maxrate", "2000k",
@@ -406,21 +406,38 @@ func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
 		Start: time.Now(),
 	}
 	var t *Task
-	select {
-	case t = <-hh.tasks.pop:
-		wo.Task = t
-		hh.worker.add <- himawariWorkerAddItem{
-			id: t.Id,
-			w:  wo,
+EXIT:
+	for {
+		select {
+		case t = <-hh.tasks.pop:
+			if t == nil {
+				break EXIT
+			}
+			if isExist(t.ep) {
+				// エンコード後ファイルが存在するのでスキップ
+				log.WithFields(log.Fields{
+					"size":     t.Size,
+					"name":     t.Name,
+					"raw_path": t.rp,
+				}).Info("すでにエンコードされている作品のようです。")
+				break
+			}
+			wo.Task = t
+			hh.worker.add <- himawariWorkerAddItem{
+				id: t.Id,
+				w:  wo,
+			}
+			log.WithFields(log.Fields{
+				"size":  wo.Task.Size,
+				"name":  wo.Task.Name,
+				"host":  wo.Host,
+				"start": wo.Start,
+			}).Info("お仕事が開始されました。")
+			break EXIT
+		default:
+			// 次の仕事なし
+			break EXIT
 		}
-		log.WithFields(log.Fields{
-			"size":  wo.Task.Size,
-			"name":  wo.Task.Name,
-			"host":  wo.Host,
-			"start": wo.Start,
-		}).Info("お仕事が開始されました。")
-	default:
-		// 次の仕事なし
 	}
 	return t
 }
