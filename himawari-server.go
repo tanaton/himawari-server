@@ -22,7 +22,7 @@ import (
 
 	"github.com/google/uuid"
 	lsd "github.com/mattn/go-lsd"
-	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 const (
@@ -91,22 +91,42 @@ type Thumbnail struct {
 	ep string
 	tp string
 }
+
+type himawariTaskAllItem struct {
+	ch chan<- []*Task
+}
+type himawariTaskPopItem struct {
+	ch chan<- *Task
+}
 type himawariTask struct {
-	all <-chan []*Task
-	pop <-chan *Task
+	all chan<- himawariTaskAllItem
+	pop chan<- himawariTaskPopItem
 	add chan<- *Task
+}
+
+type himawariWorkerAllItem struct {
+	ch chan<- map[string]Worker
 }
 type himawariWorkerAddItem struct {
 	id string
 	w  Worker
 }
+type himawariWorkerGetItem struct {
+	id string
+	ch chan<- Worker
+}
 type himawariWorker struct {
-	all <-chan map[string]Worker
+	all chan<- himawariWorkerAllItem
 	add chan<- himawariWorkerAddItem
 	del chan<- string
+	get chan<- himawariWorkerGetItem
+}
+
+type himawariCompleteAllItem struct {
+	ch chan<- []Worker
 }
 type himawariComplete struct {
-	all <-chan []Worker
+	all chan<- himawariCompleteAllItem
 	add chan<- Worker
 }
 
@@ -125,15 +145,18 @@ type Dashboard struct {
 
 var regFilename = regexp.MustCompile(`^\[(\d{6}-\d{4})\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\](.+?)_\[(.*?)\]_\[(.*?)\]\.m2ts$`)
 var serverIP string
+var log *zap.SugaredLogger
 
 func init() {
-	log.SetFormatter(&log.TextFormatter{})
-	log.SetLevel(log.InfoLevel)
+	logger, err := zap.NewProduction()
+	if err != nil {
+		panic(err)
+	}
+	log = logger.Sugar()
 
-	var err error
 	serverIP, err = externalIP()
 	if err != nil {
-		log.WithError(err).Fatal("自身のIPアドレスの取得に失敗しました。")
+		log.Fatal("自身のIPアドレスの取得に失敗しました。", err)
 	}
 }
 
@@ -143,16 +166,15 @@ func main() {
 		Addr:    fmt.Sprintf(":%d", HTTP_PORT),
 		Handler: hh,
 	}
-	log.WithError(h.ListenAndServe()).Fatal("サーバが停止しました。")
+	log.Fatal(h.ListenAndServe())
 }
 
 func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := path.Clean(r.URL.Path)
 	if strings.Index(p, "/video/id/") == 0 {
 		if r.Method == "GET" {
-			id := p[10:]
-			wo, ok := (<-hh.worker.all)[id]
-			if ok {
+			wo, err := hh.worker.Get(p[10:])
+			if err != nil {
 				rfp, err := os.Open(wo.Task.rp)
 				if err != nil {
 					// そんなファイルはない
@@ -167,10 +189,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "GET以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.WithFields(log.Fields{
-				"path":   r.URL.Path,
-				"method": r.Method,
-			}).Info("対応していないメソッドです。")
+			log.Infow("対応していないメソッドです。", "path", r.URL.Path, "method", r.Method)
 		}
 	} else if p == "/task" {
 		// お仕事
@@ -218,41 +237,43 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					w.WriteHeader(http.StatusOK)
 					n, err := buf.WriteTo(w)
 					if err != nil {
-						log.WithFields(log.Fields{
-							"path": r.URL.Path,
-							"size": tt.Size,
-							"name": tt.Name,
-						}).Info("お仕事の転送に失敗しました。", err)
+						log.Infow("お仕事の転送に失敗しました。",
+							"error", err,
+							"path", r.URL.Path,
+							"size", tt.Size,
+							"name", tt.Name,
+						)
 					} else {
-						log.WithFields(log.Fields{
-							"path": r.URL.Path,
-							"send": n,
-						}).Info("お仕事の転送に成功しました。")
+						log.Infow("お仕事の転送に成功しました。",
+							"path", r.URL.Path,
+							"send", n,
+						)
 					}
 				} else {
 					// お仕事やり直し
 					hh.workerToTask(t.Id)
 					http.Error(w, "お仕事のjsonエンコードに失敗しました。", http.StatusInternalServerError)
-					log.WithFields(log.Fields{
-						"path": r.URL.Path,
-						"size": tt.Size,
-						"name": tt.Name,
-					}).Info("お仕事のjsonエンコードに失敗しました。", err)
+					log.Infow("お仕事のjsonエンコードに失敗しました。",
+						"error", err,
+						"path", r.URL.Path,
+						"size", tt.Size,
+						"name", tt.Name,
+					)
 				}
 			} else {
 				// お仕事はない
 				http.NotFound(w, r)
-				log.WithFields(log.Fields{
-					"path":   r.URL.Path,
-					"method": r.Method,
-				}).Info("仕事がありません。")
+				log.Infow("仕事がありません。",
+					"path", r.URL.Path,
+					"method", r.Method,
+				)
 			}
 		default:
 			http.Error(w, "GET、POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.WithFields(log.Fields{
-				"path":   r.URL.Path,
-				"method": r.Method,
-			}).Info("対応していないメソッドです。")
+			log.Warnw("対応していないメソッドです。",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
 		}
 	} else if p == "/task/add" {
 		// お仕事を追加する
@@ -262,7 +283,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				t := NewTask(stat)
 				if t != nil {
 					// 追加
-					hh.tasks.add <- t
+					hh.tasks.Add(t)
 				} else {
 					// 失敗しても特にエラーではない
 				}
@@ -272,10 +293,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.WithFields(log.Fields{
-				"path":   r.URL.Path,
-				"method": r.Method,
-			}).Info("対応していないメソッドです。")
+			log.Infow("対応していないメソッドです。",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
 		}
 	} else if p == "/task/done" {
 		// お仕事完了
@@ -292,10 +313,10 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		} else {
 			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.WithFields(log.Fields{
-				"path":   r.URL.Path,
-				"method": r.Method,
-			}).Info("対応していないメソッドです。")
+			log.Infow("対応していないメソッドです。",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
 		}
 	} else if strings.Index(p, "/task/id/") == 0 {
 		// 実装は後で
@@ -310,10 +331,13 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
+	tall, _ := hh.tasks.All()
+	wall, _ := hh.worker.All()
+	call, _ := hh.completed.All()
 	db := Dashboard{
-		Tasks:     <-hh.tasks.all,
-		Worker:    <-hh.worker.all,
-		Completed: <-hh.completed.all,
+		Tasks:     tall,
+		Worker:    wall,
+		Completed: call,
 	}
 	tmpl := template.New("t")
 	tmpl.Funcs(template.FuncMap{
@@ -328,23 +352,24 @@ func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
 	})
 	template.Must(tmpl.ParseFiles(filepath.Join(HTTP_DIR, "index.html")))
 	if err := tmpl.ExecuteTemplate(w, "index.html", db); err != nil {
-		log.WithError(err).Warn("index.htmlの生成に失敗しました。")
+		log.Warn("index.htmlの生成に失敗しました。", err)
 	}
 }
 
 func (hh *himawariHandle) done(r *http.Request) error {
 	id := r.PostFormValue("uuid")
 
-	wo, ok := (<-hh.worker.all)[id]
-	if ok {
+	wo, err := hh.worker.Get(id)
+	if err != nil {
 		err := readPostFile(r, wo.Task.ep)
 		if err != nil {
-			log.WithFields(log.Fields{
-				"size":  wo.Task.Size,
-				"name":  wo.Task.Name,
-				"host":  wo.Host,
-				"start": wo.Start,
-			}).Warn("アップロードに失敗しました。", err)
+			log.Warnw("アップロードに失敗しました。",
+				"error", err,
+				"size", wo.Task.Size,
+				"name", wo.Task.Name,
+				"host", wo.Host,
+				"start", wo.Start,
+			)
 			return err
 		}
 		wo.Task.Duration = getMovieDuration(wo.Task.ep)
@@ -352,38 +377,40 @@ func (hh *himawariHandle) done(r *http.Request) error {
 			// 動画の長さがゼロはおかしい
 			// ファイルを消しておく
 			os.Remove(wo.Task.ep)
-			log.WithFields(log.Fields{
-				"size":  wo.Task.Size,
-				"name":  wo.Task.Name,
-				"host":  wo.Host,
-				"start": wo.Start,
-			}).Warn("動画の長さがゼロです。", err)
+			log.Warnw("動画の長さがゼロです。",
+				"error", err,
+				"size", wo.Task.Size,
+				"name", wo.Task.Name,
+				"host", wo.Host,
+				"start", wo.Start,
+			)
 			return errors.New("動画の長さがゼロのようです")
 		}
 		// 削除フォルダに移動
 		err = os.Rename(wo.Task.rp, wo.Task.dp)
 		if err != nil {
-			log.WithFields(log.Fields{
-				"size":  wo.Task.Size,
-				"name":  wo.Task.Name,
-				"host":  wo.Host,
-				"start": wo.Start,
-			}).Warn("RAW動画の移動に失敗しました。", err)
+			log.Warnw("RAW動画の移動に失敗しました。",
+				"error", err,
+				"size", wo.Task.Size,
+				"name", wo.Task.Name,
+				"host", wo.Host,
+				"start", wo.Start,
+			)
 			return err
 		}
 		wo.End = time.Now()
 
 		// お仕事完了
-		hh.worker.del <- id
+		hh.worker.Del(id)
 		// お仕事完了リストに追加
-		hh.completed.add <- wo
-		log.WithFields(log.Fields{
-			"size":  wo.Task.Size,
-			"name":  wo.Task.Name,
-			"host":  wo.Host,
-			"start": wo.Start,
-			"end":   wo.End,
-		}).Info("お仕事が完遂されました。")
+		hh.completed.Add(wo)
+		log.Infow("お仕事が完遂されました。",
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+			"end", wo.End,
+		)
 		// サムネイル作成
 		hh.thumbc <- Thumbnail{
 			d:  wo.Task.Duration,
@@ -406,56 +433,47 @@ func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
 		Start: time.Now(),
 	}
 	var t *Task
-EXIT:
 	for {
-		select {
-		case t = <-hh.tasks.pop:
-			if t == nil {
-				break EXIT
-			}
-			if isExist(t.ep) {
-				// エンコード後ファイルが存在するのでスキップ
-				log.WithFields(log.Fields{
-					"size":     t.Size,
-					"name":     t.Name,
-					"raw_path": t.rp,
-				}).Info("すでにエンコードされている作品のようです。")
-				break
-			}
-			wo.Task = t
-			hh.worker.add <- himawariWorkerAddItem{
-				id: t.Id,
-				w:  wo,
-			}
-			log.WithFields(log.Fields{
-				"size":  wo.Task.Size,
-				"name":  wo.Task.Name,
-				"host":  wo.Host,
-				"start": wo.Start,
-			}).Info("お仕事が開始されました。")
-			break EXIT
-		default:
-			// 次の仕事なし
-			break EXIT
+		t, err = hh.tasks.Pop()
+		if err != nil {
+			// タスクが空
+			break
 		}
+		if isExist(t.ep) {
+			// エンコード後ファイルが存在するのでスキップ
+			log.Infow("すでにエンコードされている作品のようです。",
+				"size", t.Size,
+				"name", t.Name,
+				"raw_path", t.rp,
+			)
+			continue
+		}
+		wo.Task = t
+		hh.worker.Add(t.Id, wo)
+		log.Infow("お仕事が開始されました。",
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+		)
+		break
 	}
 	return t
 }
 
 func (hh *himawariHandle) workerToTask(idlist ...string) {
-	worker := <-hh.worker.all
 	for _, id := range idlist {
-		wo, ok := worker[id]
-		if ok {
+		wo, err := hh.worker.Get(id)
+		if err != nil {
 			// 新しいUUIDにする
 			wo.Task.Id = NewUUID()
-			hh.worker.del <- id
-			hh.tasks.add <- wo.Task
-			log.WithFields(log.Fields{
-				"size":  wo.Task.Size,
-				"name":  wo.Task.Name,
-				"start": wo.Start,
-			}).Info("仕事をタスクリストに戻しました。")
+			hh.worker.Del(id)
+			hh.tasks.Add(wo.Task)
+			log.Infow("仕事をタスクリストに戻しました。",
+				"size", wo.Task.Size,
+				"name", wo.Task.Name,
+				"start", wo.Start,
+			)
 		}
 	}
 }
@@ -467,40 +485,34 @@ func NewUUID() string {
 func NewHimawari() *himawariHandle {
 	dir, err := ioutil.ReadDir(RAW_PATH)
 	if err != nil {
-		log.WithError(err).Warn("RAW_PATHの読み込みに失敗しました。")
+		log.Warn("RAW_PATHの読み込みに失敗しました。", err)
 		return nil
 	}
 
 	hh := &himawariHandle{}
 	hh.file = http.FileServer(http.Dir(HTTP_DIR))
 	hh.tasks = func() himawariTask {
-		allc := make(chan []*Task)
-		popc := make(chan *Task)
+		allc := make(chan himawariTaskAllItem)
+		popc := make(chan himawariTaskPopItem)
 		addc := make(chan *Task, 4)
 		go func() {
 			data := make([]*Task, 0, 16)
-			var datacopy []*Task
-			var popcw chan<- *Task
-			datahead := func() *Task {
-				if len(data) > 0 {
-					return data[0]
-				}
-				return nil
-			}
 			for {
 				select {
-				case allc <- datacopy:
-				case popcw <- datahead():
-					data = data[1:]
-					if len(data) <= 0 {
-						popcw = nil
+				case item := <-allc:
+					datacopy := make([]*Task, len(data))
+					copy(datacopy, data)
+					item.ch <- datacopy
+				case item := <-popc:
+					if len(data) > 0 {
+						item.ch <- data[0]
+						data = data[1:]
+					} else {
+						close(item.ch)
 					}
 				case t := <-addc:
 					data = append(data, t)
-					popcw = popc
 				}
-				datacopy = make([]*Task, len(data))
-				copy(datacopy, data)
 			}
 		}()
 		return himawariTask{
@@ -510,20 +522,32 @@ func NewHimawari() *himawariHandle {
 		}
 	}()
 	hh.worker = func() himawariWorker {
-		allc := make(chan map[string]Worker)
-		delc := make(chan string, 4)
+		allc := make(chan himawariWorkerAllItem)
 		addc := make(chan himawariWorkerAddItem, 4)
+		delc := make(chan string, 4)
+		getc := make(chan himawariWorkerGetItem)
 		go func() {
 			tic := time.NewTicker(WORKER_CHECK_DURATION)
 			data := make(map[string]Worker)
-			var datacopy map[string]Worker
 			for {
 				select {
-				case allc <- datacopy:
-				case id := <-delc:
-					delete(data, id)
+				case item := <-allc:
+					datacopy := make(map[string]Worker)
+					for k, v := range data {
+						datacopy[k] = v
+					}
+					item.ch <- datacopy
 				case item := <-addc:
 					data[item.id] = item.w
+				case id := <-delc:
+					delete(data, id)
+				case item := <-getc:
+					w, ok := data[item.id]
+					if ok {
+						item.ch <- w
+					} else {
+						close(item.ch)
+					}
 				case now := <-tic.C:
 					idlist := []string{}
 					for key, it := range data {
@@ -534,28 +558,27 @@ func NewHimawari() *himawariHandle {
 					// goroutine使わないとデッドロックする
 					go hh.workerToTask(idlist...)
 				}
-				datacopy = make(map[string]Worker)
-				for k, v := range data {
-					datacopy[k] = v
-				}
 			}
 		}()
 		return himawariWorker{
 			all: allc,
 			add: addc,
 			del: delc,
+			get: getc,
 		}
 	}()
 	hh.completed = func() himawariComplete {
-		allc := make(chan []Worker)
+		allc := make(chan himawariCompleteAllItem)
 		addc := make(chan Worker)
 		go func() {
 			tic := time.NewTicker(WORKER_CHECK_DURATION)
 			data := make([]Worker, 0, 16)
-			var datacopy []Worker
 			for {
 				select {
-				case allc <- datacopy:
+				case item := <-allc:
+					datacopy := make([]Worker, len(data))
+					copy(datacopy, data)
+					item.ch <- datacopy
 				case w := <-addc:
 					data = append(data, w)
 				case now := <-tic.C:
@@ -567,13 +590,9 @@ func NewHimawari() *himawariHandle {
 					}
 					if i >= 0 {
 						data = data[i+1:]
-						log.WithFields(log.Fields{
-							"count": i,
-						}).Info("完了リストの定期清掃を実施しました。")
+						log.Infow("完了リストの定期清掃を実施しました。", "count", i)
 					}
 				}
-				datacopy = make([]Worker, len(data))
-				copy(datacopy, data)
 			}
 		}()
 		return himawariComplete{
@@ -585,7 +604,7 @@ func NewHimawari() *himawariHandle {
 	for _, it := range dir {
 		t := NewTask(it)
 		if t != nil {
-			hh.tasks.add <- t
+			hh.tasks.Add(t)
 		}
 	}
 	thumbChan := make(chan Thumbnail, 256)
@@ -594,6 +613,86 @@ func NewHimawari() *himawariHandle {
 	go thumbnailstart(thumbChan)
 
 	return hh
+}
+
+func (ht himawariTask) All() ([]*Task, error) {
+	ch := make(chan []*Task)
+	ht.all <- himawariTaskAllItem{
+		ch: ch,
+	}
+	tl, ok := <-ch
+	if !ok {
+		return nil, errors.New("panic")
+	}
+	return tl, nil
+}
+
+func (ht himawariTask) Pop() (*Task, error) {
+	ch := make(chan *Task)
+	ht.pop <- himawariTaskPopItem{
+		ch: ch,
+	}
+	t, ok := <-ch
+	if !ok {
+		return nil, errors.New("タスクリストが空でした。")
+	}
+	return t, nil
+}
+
+func (ht himawariTask) Add(t *Task) {
+	ht.add <- t
+}
+
+func (hw himawariWorker) All() (map[string]Worker, error) {
+	ch := make(chan map[string]Worker)
+	hw.all <- himawariWorkerAllItem{
+		ch: ch,
+	}
+	mw, ok := <-ch
+	if !ok {
+		return nil, errors.New("panic")
+	}
+	return mw, nil
+}
+
+func (hw himawariWorker) Add(id string, wo Worker) {
+	hw.add <- himawariWorkerAddItem{
+		id: id,
+		w:  wo,
+	}
+}
+
+func (hw himawariWorker) Del(id string) {
+	hw.del <- id
+}
+
+func (hw himawariWorker) Get(id string) (Worker, error) {
+	ch := make(chan Worker)
+	hw.get <- himawariWorkerGetItem{
+		id: id,
+		ch: ch,
+	}
+	w, ok := <-ch
+	if !ok {
+		return w, errors.New("Workerが見つかりませんでした。")
+	}
+	return w, nil
+}
+
+func (hc himawariComplete) All() ([]Worker, error) {
+	ch := make(chan []Worker)
+	hc.all <- himawariCompleteAllItem{
+		ch: ch,
+	}
+	wl, ok := <-ch
+	if !ok {
+		return nil, errors.New("panic")
+	}
+	return wl, nil
+}
+
+func (hc himawariComplete) Add(wo Worker) {
+	hc.add <- wo
 }
 
 func thumbnailstart(tc chan<- Thumbnail) {
@@ -660,23 +759,23 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 		for i = 0; i <= count; i++ {
 			err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
 			if err != nil {
-				log.WithFields(log.Fields{
-					"encoded_path":   t.ep,
-					"thumbnail_path": t.tp,
-					"duration":       t.d,
-					"index":          int(i),
-					"error":          err,
-				}).Warn("サムネイルの作成に失敗しました。")
+				log.Warnw("サムネイルの作成に失敗しました。",
+					"encoded_path", t.ep,
+					"thumbnail_path", t.tp,
+					"duration", t.d,
+					"index", int(i),
+					"error", err,
+				)
 				break
 			}
 		}
 		if i > count {
-			log.WithFields(log.Fields{
-				"encoded_path":   t.ep,
-				"thumbnail_path": t.tp,
-				"duration":       t.d,
-				"count":          int(count),
-			}).Info("サムネイル作成完了")
+			log.Infow("サムネイル作成完了",
+				"encoded_path", t.ep,
+				"thumbnail_path", t.tp,
+				"duration", t.d,
+				"count", int(count),
+			)
 		}
 	}
 }
@@ -703,10 +802,10 @@ func NewTask(it os.FileInfo) *Task {
 	category_path := filepath.Join(ENCODED_PATH, t.Category)
 	cerr := os.MkdirAll(category_path, 0755)
 	if cerr != nil {
-		log.WithFields(log.Fields{
-			"name":  t.Name,
-			"error": cerr,
-		}).Warn("カテゴリフォルダ作成に失敗しました。")
+		log.Warnw("カテゴリフォルダ作成に失敗しました。",
+			"name", t.Name,
+			"error", cerr,
+		)
 		return nil
 	}
 
@@ -717,10 +816,10 @@ func NewTask(it os.FileInfo) *Task {
 	title_path := filepath.Join(category_path, t.Title)
 	terr := os.MkdirAll(title_path, 0755)
 	if terr != nil {
-		log.WithFields(log.Fields{
-			"name":  t.Name,
-			"error": terr,
-		}).Warn("作品フォルダ作成に失敗しました。")
+		log.Warnw("作品フォルダ作成に失敗しました。",
+			"name", t.Name,
+			"error", terr,
+		)
 		return nil
 	}
 	// 同じ名前ならエンコードを省略
@@ -739,18 +838,18 @@ func NewTask(it os.FileInfo) *Task {
 	t.tp = filepath.Join(THUMBNAIL_PATH, t.Category, t.Title, t.Subtitle)
 	if isExist(t.ep) {
 		// エンコード後ファイルが存在するのでスキップ
-		log.WithFields(log.Fields{
-			"size":     t.Size,
-			"name":     t.Name,
-			"raw_path": t.rp,
-		}).Info("すでにエンコードされている作品のようです。")
+		log.Infow("すでにエンコードされている作品のようです。",
+			"size", t.Size,
+			"name", t.Name,
+			"raw_path", t.rp,
+		)
 		return nil
 	}
-	log.WithFields(log.Fields{
-		"size":     t.Size,
-		"name":     t.Name,
-		"raw_path": t.rp,
-	}).Info("新しいタスクを登録しました。")
+	log.Infow("新しいタスクを登録しました。",
+		"size", t.Size,
+		"name", t.Name,
+		"raw_path", t.rp,
+	)
 	return t
 }
 
