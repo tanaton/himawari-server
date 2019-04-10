@@ -403,7 +403,7 @@ func (hh *himawariHandle) done(r *http.Request) error {
 		// お仕事完了
 		hh.worker.Del(id)
 		// お仕事完了リストに追加
-		hh.completed.add <- wo
+		hh.completed.Add(wo)
 		log.Infow("お仕事が完遂されました。",
 			"size", wo.Task.Size,
 			"name", wo.Task.Name,
