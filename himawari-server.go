@@ -40,7 +40,7 @@ const (
 	PRESET_PREFIX               = "libx265-hq-ts_"
 	PRESET_EXT                  = ".ffpreset"
 	ENCODE_THREADS              = 0
-	THUMBNAIL_INTERVAL_DURATION = time.Second * 10
+	THUMBNAIL_INTERVAL_DURATION = 10
 )
 
 const PRESET_DATA = `level=41
@@ -161,12 +161,16 @@ func init() {
 }
 
 func main() {
-	hh := NewHimawari()
+	log.Fatal(run())
+}
+
+func run() error {
+	defer log.Sync()
 	h := &http.Server{
 		Addr:    fmt.Sprintf(":%d", HTTP_PORT),
-		Handler: hh,
+		Handler: NewHimawari(),
 	}
-	log.Fatal(h.ListenAndServe())
+	return h.ListenAndServe()
 }
 
 func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -745,6 +749,7 @@ func thumbnailstart(tc chan<- Thumbnail) {
 }
 
 func thumbnailcycle(tc <-chan Thumbnail) {
+	sy := make(chan struct{}, 8)
 	for t := range tc {
 		if isExist(t.tp) {
 			// 存在する場合はスルー
@@ -754,27 +759,32 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 			// フォルダ作成に失敗
 			continue
 		}
-		count := t.d / THUMBNAIL_INTERVAL_DURATION
-		var i time.Duration
+		count := int64(t.d / (time.Second * THUMBNAIL_INTERVAL_DURATION))
+		var i int64
 		for i = 0; i <= count; i++ {
-			err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
-			if err != nil {
-				log.Warnw("サムネイルの作成に失敗しました。",
-					"encoded_path", t.ep,
-					"thumbnail_path", t.tp,
-					"duration", t.d,
-					"index", int(i),
-					"error", err,
-				)
-				break
-			}
+			sy <- struct{}{}
+			go func(t Thumbnail, i int64) {
+				defer func() {
+					<-sy
+				}()
+				err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
+				if err != nil {
+					log.Warnw("サムネイルの作成に失敗しました。",
+						"encoded_path", t.ep,
+						"thumbnail_path", t.tp,
+						"duration", t.d,
+						"index", i,
+						"error", err,
+					)
+				}
+			}(t, i)
 		}
 		if i > count {
 			log.Infow("サムネイル作成完了",
 				"encoded_path", t.ep,
 				"thumbnail_path", t.tp,
 				"duration", t.d,
-				"count", int(count),
+				"count", count,
 			)
 		}
 	}
@@ -965,11 +975,10 @@ func getMovieDuration(p string) time.Duration {
 	return d
 }
 
-func createMovieThumbnail(ep, tp string, dur time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+func createMovieThumbnail(ep, tp string, sec int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 	// ffmpegもffprobeもstderrに出力するのでffmpegを使っておく
-	sec := int64(dur / time.Second)
 	args := []string{
 		"-ss", strconv.FormatInt(sec, 10),
 		"-i", ep,
