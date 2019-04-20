@@ -178,15 +178,15 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.Index(p, "/video/id/") == 0 {
 		if r.Method == "GET" {
 			wo, err := hh.worker.Get(p[10:])
-			if err != nil {
+			if err == nil {
 				rfp, err := os.Open(wo.Task.rp)
-				if err != nil {
+				if err == nil {
+					defer rfp.Close()
+					http.ServeContent(w, r, wo.Task.Name, wo.Start, rfp)
+				} else {
 					// そんなファイルはない
 					http.NotFound(w, r)
 					log.Infow("存在しないファイルです。", "path", r.URL.Path, "method", r.Method)
-				} else {
-					defer rfp.Close()
-					http.ServeContent(w, r, wo.Task.Name, wo.Start, rfp)
 				}
 			} else {
 				// そんな仕事はない
