@@ -367,64 +367,63 @@ func (hh *himawariHandle) done(r *http.Request) error {
 
 	wo, err := hh.worker.Get(id)
 	if err != nil {
-		err := readPostFile(r, wo.Task.ep)
-		if err != nil {
-			log.Warnw("アップロードに失敗しました。",
-				"error", err,
-				"size", wo.Task.Size,
-				"name", wo.Task.Name,
-				"host", wo.Host,
-				"start", wo.Start,
-			)
-			return err
-		}
-		wo.Task.Duration = getMovieDuration(wo.Task.ep)
-		if wo.Task.Duration == 0 {
-			// 動画の長さがゼロはおかしい
-			// ファイルを消しておく
-			os.Remove(wo.Task.ep)
-			log.Warnw("動画の長さがゼロです。",
-				"error", err,
-				"size", wo.Task.Size,
-				"name", wo.Task.Name,
-				"host", wo.Host,
-				"start", wo.Start,
-			)
-			return errors.New("動画の長さがゼロのようです")
-		}
-		// 削除フォルダに移動
-		err = os.Rename(wo.Task.rp, wo.Task.dp)
-		if err != nil {
-			log.Warnw("RAW動画の移動に失敗しました。",
-				"error", err,
-				"size", wo.Task.Size,
-				"name", wo.Task.Name,
-				"host", wo.Host,
-				"start", wo.Start,
-			)
-			return err
-		}
-		wo.End = time.Now()
-
-		// お仕事完了
-		hh.worker.Del(id)
-		// お仕事完了リストに追加
-		hh.completed.Add(wo)
-		log.Infow("お仕事が完遂されました。",
+		return errors.New("仕事が無い")
+	}
+	err = readPostFile(r, wo.Task.ep)
+	if err != nil {
+		log.Warnw("アップロードに失敗しました。",
+			"error", err,
 			"size", wo.Task.Size,
 			"name", wo.Task.Name,
 			"host", wo.Host,
 			"start", wo.Start,
-			"end", wo.End,
 		)
-		// サムネイル作成
-		hh.thumbc <- Thumbnail{
-			d:  wo.Task.Duration,
-			ep: wo.Task.ep,
-			tp: wo.Task.tp,
-		}
-	} else {
-		return errors.New("仕事が無い")
+		return err
+	}
+	wo.Task.Duration = getMovieDuration(wo.Task.ep)
+	if wo.Task.Duration == 0 {
+		// 動画の長さがゼロはおかしい
+		// ファイルを消しておく
+		os.Remove(wo.Task.ep)
+		log.Warnw("動画の長さがゼロです。",
+			"error", err,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+		)
+		return errors.New("動画の長さがゼロのようです")
+	}
+	// 削除フォルダに移動
+	err = os.Rename(wo.Task.rp, wo.Task.dp)
+	if err != nil {
+		log.Warnw("RAW動画の移動に失敗しました。",
+			"error", err,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+		)
+		return err
+	}
+	wo.End = time.Now()
+
+	// お仕事完了
+	hh.worker.Del(id)
+	// お仕事完了リストに追加
+	hh.completed.Add(wo)
+	log.Infow("お仕事が完遂されました。",
+		"size", wo.Task.Size,
+		"name", wo.Task.Name,
+		"host", wo.Host,
+		"start", wo.Start,
+		"end", wo.End,
+	)
+	// サムネイル作成
+	hh.thumbc <- Thumbnail{
+		d:  wo.Task.Duration,
+		ep: wo.Task.ep,
+		tp: wo.Task.tp,
 	}
 	return nil
 }
@@ -471,16 +470,17 @@ func (hh *himawariHandle) workerToTask(idlist ...string) {
 	for _, id := range idlist {
 		wo, err := hh.worker.Get(id)
 		if err != nil {
-			// 新しいUUIDにする
-			wo.Task.Id = NewUUID()
-			hh.worker.Del(id)
-			hh.tasks.Add(wo.Task)
-			log.Infow("仕事をタスクリストに戻しました。",
-				"size", wo.Task.Size,
-				"name", wo.Task.Name,
-				"start", wo.Start,
-			)
+			continue
 		}
+		// 新しいUUIDにする
+		wo.Task.Id = NewUUID()
+		hh.worker.Del(id)
+		hh.tasks.Add(wo.Task)
+		log.Infow("仕事をタスクリストに戻しました。",
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"start", wo.Start,
+		)
 	}
 }
 
