@@ -183,6 +183,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					// そんなファイルはない
 					http.NotFound(w, r)
+					log.Infow("存在しないファイルです。", "path", r.URL.Path, "method", r.Method)
 				} else {
 					defer rfp.Close()
 					http.ServeContent(w, r, wo.Task.Name, wo.Start, rfp)
@@ -190,6 +191,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			} else {
 				// そんな仕事はない
 				http.NotFound(w, r)
+				log.Infow("存在しない仕事です。", "path", r.URL.Path, "method", r.Method)
 			}
 		} else {
 			http.Error(w, "GET以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
@@ -274,7 +276,7 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		default:
 			http.Error(w, "GET、POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.Warnw("対応していないメソッドです。",
+			log.Infow("対応していないメソッドです。",
 				"path", r.URL.Path,
 				"method", r.Method,
 			)
