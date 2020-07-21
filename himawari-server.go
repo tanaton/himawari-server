@@ -64,7 +64,7 @@ qmin=10
 rc_eq='blurCplx^(1-qComp)'
 bf=16
 bidir_refine=1
-refs=16
+refs=6
 deblock=0:0`
 
 type Task struct {
