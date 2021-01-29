@@ -37,8 +37,6 @@ const (
 	WORKER_DELETE_DURATION    = time.Hour * 24
 	COMPLETED_DELETE_DURATION = time.Hour * 24 * 7
 
-	PRESET_PREFIX               = "libx265-hq-ts_"
-	PRESET_EXT                  = ".ffpreset"
 	ENCODE_THREADS              = 0
 	THUMBNAIL_INTERVAL_DURATION = 10
 )
@@ -204,23 +202,19 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// お仕事を得る
 			t := hh.taskToWorker(r)
 			if t != nil {
-				pname := PRESET_PREFIX + t.Id + PRESET_EXT
 				tt := struct {
 					Task
-					PresetName string
 					PresetData string
 					Command    string
 					Args       []string
 				}{
 					Task:       *t,
-					PresetName: pname,
 					PresetData: PRESET_DATA,
 					Command:    "ffmpeg",
 					Args: []string{
 						"-y",
 						"-i", fmt.Sprintf("http://%s:%d/video/id/%s", serverIP, HTTP_PORT, t.Id),
 						"-threads", strconv.FormatInt(getHeaderDec(r, "X-Himawari-Threads", ENCODE_THREADS), 10),
-						"-fpre", pname,
 						"-vcodec", "libx265",
 						"-acodec", "aac", // libfdk_aac
 						"-ar", "48000",
