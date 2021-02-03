@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,14 +13,18 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"text/template"
 	"time"
 
+	"github.com/NYTimes/gziphandler"
 	"github.com/google/uuid"
 	lsd "github.com/mattn/go-lsd"
 	"go.uber.org/zap"
@@ -65,7 +70,7 @@ bidir_refine=1
 refs=6
 deblock=0:0`
 
-type Task struct {
+type TaskItem struct {
 	Id       string
 	Size     int64
 	Name     string
@@ -78,8 +83,8 @@ type Task struct {
 	dp       string // delete
 	tp       string // thumbnail
 }
-type Worker struct {
-	Task  *Task
+type WorkerItem struct {
+	Task  *TaskItem
 	Host  string
 	Start time.Time
 	End   time.Time
@@ -91,56 +96,90 @@ type Thumbnail struct {
 }
 
 type himawariTaskAllItem struct {
-	ch chan<- []*Task
+	ch chan<- []*TaskItem
 }
 type himawariTaskPopItem struct {
-	ch chan<- *Task
+	ch chan<- *TaskItem
 }
 type himawariTask struct {
-	all chan<- himawariTaskAllItem
-	pop chan<- himawariTaskPopItem
-	add chan<- *Task
+	allc chan<- himawariTaskAllItem
+	popc chan<- himawariTaskPopItem
+	addc chan<- *TaskItem
 }
 
 type himawariWorkerAllItem struct {
-	ch chan<- map[string]Worker
+	ch chan<- map[string]WorkerItem
 }
 type himawariWorkerAddItem struct {
 	id string
-	w  Worker
+	w  WorkerItem
 }
 type himawariWorkerGetItem struct {
 	id string
-	ch chan<- Worker
+	ch chan<- WorkerItem
 }
 type himawariWorker struct {
-	all chan<- himawariWorkerAllItem
-	add chan<- himawariWorkerAddItem
-	del chan<- string
-	get chan<- himawariWorkerGetItem
+	allc chan<- himawariWorkerAllItem
+	addc chan<- himawariWorkerAddItem
+	delc chan<- string
+	getc chan<- himawariWorkerGetItem
 }
 
 type himawariCompleteAllItem struct {
-	ch chan<- []Worker
+	ch chan<- []WorkerItem
 }
 type himawariComplete struct {
-	all chan<- himawariCompleteAllItem
-	add chan<- Worker
+	allc chan<- himawariCompleteAllItem
+	addc chan<- WorkerItem
 }
 
 type himawariHandle struct {
 	file      http.Handler
 	thumbc    chan<- Thumbnail
-	tasks     himawariTask
-	worker    himawariWorker
-	completed himawariComplete
+	tasks     *himawariTask
+	worker    *himawariWorker
+	completed *himawariComplete
 }
 type Dashboard struct {
-	Tasks     []*Task
-	Worker    map[string]Worker
-	Completed []Worker
+	Tasks     []*TaskItem
+	Worker    map[string]WorkerItem
+	Completed []WorkerItem
+}
+type serverItem struct {
+	s *http.Server
+	f func(s *http.Server) error
+}
+type himawari struct {
+	wg sync.WaitGroup
+}
+type himawariTaskStartHandle struct {
+	tasks  *himawariTask
+	worker *himawariWorker
+}
+type himawariTaskDoneHandle struct {
+	thumbc    chan<- Thumbnail
+	worker    *himawariWorker
+	completed *himawariComplete
+}
+type himawariTaskDataSendHandle struct {
+	worker *himawariWorker
+}
+type himawariTaskAddHandle struct {
+	tasks *himawariTask
+}
+type himawariDashboardHandle struct {
+	tasks     *himawariTask
+	worker    *himawariWorker
+	completed *himawariComplete
 }
 
+var gzipContentTypeList = []string{
+	"text/html",
+	"text/css",
+	"text/javascript",
+	"text/plain",
+	"application/json",
+}
 var regFilename = regexp.MustCompile(`^\[(\d{6}-\d{4})\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\](.+?)_\[(.*?)\]_\[(.*?)\]\.m2ts$`)
 var serverIP string
 var log *zap.SugaredLogger
@@ -159,23 +198,282 @@ func init() {
 }
 
 func main() {
-	log.Fatal(run())
+	defer func() {
+		if err := recover(); err != nil {
+			log.Warnw("panic!!!", "error", err)
+			log.Sync()
+			os.Exit(1)
+		}
+	}()
+	os.Exit(_main())
 }
 
-func run() error {
-	defer log.Sync()
-	h := &http.Server{
-		Addr:    fmt.Sprintf(":%d", HTTP_PORT),
-		Handler: NewHimawari(),
+func _main() int {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer func() {
+		log.Sync()
+		cancel()
+	}()
+
+	hi := himawari{}
+	if err := hi.run(ctx); err != nil {
+		return 1
 	}
-	return h.ListenAndServe()
+	return 0
 }
 
-func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (hi *himawari) run(bctx context.Context) error {
+	ctx, exitch := hi.startExitManageProc(bctx)
+
+	thumbChan := make(chan Thumbnail, 256)
+	tasks := hi.NewHimawariTask(ctx)
+	worker := hi.NewHimawariWorker(ctx, tasks)
+	completed := hi.NewHimawariCompleted(ctx)
+
+	hi.wg.Add(1)
+	go hi.thumbnailcycle(ctx, thumbChan)
+	hi.wg.Add(1)
+	go hi.thumbnailstart(ctx, thumbChan)
+
+	http.Handle("/video/id/", &himawariTaskDataSendHandle{
+		worker: worker,
+	})
+	http.Handle("/task", &himawariTaskStartHandle{
+		tasks:  tasks,
+		worker: worker,
+	})
+	http.Handle("/task/add", &himawariTaskAddHandle{
+		tasks: tasks,
+	})
+	http.Handle("/task/done", &himawariTaskDoneHandle{
+		thumbc:    thumbChan,
+		worker:    worker,
+		completed: completed,
+	})
+	// http.Handle("/task/id/")
+	http.Handle("/index.html", &himawariDashboardHandle{
+		tasks:     tasks,
+		worker:    worker,
+		completed: completed,
+	})
+	http.Handle("/", http.FileServer(http.Dir(HTTP_DIR)))
+
+	err := tasks.addAll()
+	if err != nil {
+		exitch <- struct{}{}
+		log.Infow("タスク追加に失敗しました。", "error", err)
+		return hi.shutdown(ctx)
+	}
+
+	ghfunc, err := gziphandler.GzipHandlerWithOpts(gziphandler.CompressionLevel(gzip.BestSpeed), gziphandler.ContentTypes(gzipContentTypeList))
+	if err != nil {
+		exitch <- struct{}{}
+		log.Infow("サーバーハンドラの作成に失敗しました。", "error", err)
+		return hi.shutdown(ctx)
+	}
+	h := ghfunc(http.DefaultServeMux)
+
+	sl := append([]serverItem{}, serverItem{
+		s: &http.Server{
+			Addr:    fmt.Sprintf(":%d", HTTP_PORT),
+			Handler: h,
+		},
+		f: func(s *http.Server) error { return s.ListenAndServe() },
+	})
+
+	for _, it := range sl {
+		// ローカル化
+		s := it
+		// WEBサーバー起動
+		hi.wg.Add(1)
+		go s.startServer(&hi.wg)
+	}
+
+	// シャットダウン管理
+	return hi.shutdown(ctx, sl...)
+}
+
+func (srv serverItem) startServer(wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Infow("serverItem.startServer", "Addr", srv.s.Addr)
+	// サーバ起動
+	err := srv.f(srv.s)
+	// サーバが終了した場合
+	if err != nil {
+		if err == http.ErrServerClosed {
+			log.Infow("サーバーがシャットダウンしました。", "error", err, "Addr", srv.s.Addr)
+		} else {
+			log.Warnw("サーバーが落ちました。", "error", err)
+		}
+	}
+}
+
+func (hi *himawari) shutdown(ctx context.Context, sl ...serverItem) error {
+	// シグナル等でサーバを中断する
+	<-ctx.Done()
+	// シャットダウン処理用コンテキストの用意
+	sctx, scancel := context.WithCancel(context.Background())
+	defer scancel()
+	for _, srv := range sl {
+		hi.wg.Add(1)
+		go func(ctx context.Context, srv *http.Server) {
+			sctx, sscancel := context.WithTimeout(ctx, time.Second*10)
+			defer func() {
+				sscancel()
+				hi.wg.Done()
+			}()
+			err := srv.Shutdown(sctx)
+			if err != nil {
+				log.Warnw("サーバーの終了に失敗しました。", "error", err)
+			} else {
+				log.Infow("サーバーの終了に成功しました。", "Addr", srv.Addr)
+			}
+		}(sctx, srv.s)
+	}
+	// サーバーの終了待機
+	hi.wg.Wait()
+	return log.Sync()
+}
+
+func (hi *himawari) startExitManageProc(ctx context.Context) (context.Context, chan<- struct{}) {
+	exitch := make(chan struct{}, 1)
+	ectx, cancel := context.WithCancel(ctx)
+	hi.wg.Add(1)
+	go func(ctx context.Context, ch <-chan struct{}) {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig,
+			syscall.SIGHUP,
+			syscall.SIGINT,
+			syscall.SIGTERM,
+			syscall.SIGQUIT,
+			os.Interrupt,
+			os.Kill,
+		)
+		defer func() {
+			signal.Stop(sig)
+			cancel()
+			hi.wg.Done()
+		}()
+
+		select {
+		case <-ctx.Done():
+			log.Infow("Cancel from parent")
+		case s := <-sig:
+			log.Infow("Signal!!", "signal", s)
+		case <-ch:
+			log.Infow("Exit command!!")
+		}
+	}(ectx, exitch)
+	return ectx, exitch
+}
+
+func (hh *himawariTaskStartHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// お仕事
+	switch r.Method {
+	case "GET":
+		// お仕事を得る
+		t := hh.tasks.toWorker(hh.worker, r)
+		if t != nil {
+			tt := struct {
+				TaskItem
+				PresetData string
+				Command    string
+				Args       []string
+			}{
+				TaskItem:   *t,
+				PresetData: PRESET_DATA,
+				Command:    "ffmpeg",
+				Args: []string{
+					"-y",
+					"-i", fmt.Sprintf("http://%s:%d/video/id/%s", serverIP, HTTP_PORT, t.Id),
+					"-threads", strconv.FormatInt(getHeaderDec(r, "X-himawari-Threads", ENCODE_THREADS), 10),
+					"-vcodec", "libx265",
+					"-acodec", "aac", // libfdk_aac
+					"-ar", "48000",
+					"-ab", "128k",
+					"-r", "30000/1001",
+					"-s", "1280x720",
+					"-vsync", "1",
+					"-deinterlace",
+					"-pix_fmt", "yuv420p",
+					"-f", "mp4",
+					"-bufsize", "200000k",
+					"-maxrate", "2000k",
+				},
+			}
+			buf := bytes.Buffer{}
+			err := json.NewEncoder(&buf).Encode(&tt)
+			if err == nil {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				w.Header().Set("X-Content-Type-Options", "nosniff")
+				w.WriteHeader(http.StatusOK)
+				n, err := buf.WriteTo(w)
+				if err != nil {
+					log.Infow("お仕事の転送に失敗しました。",
+						"error", err,
+						"path", r.URL.Path,
+						"size", tt.Size,
+						"name", tt.Name,
+					)
+				} else {
+					log.Infow("お仕事の転送に成功しました。",
+						"path", r.URL.Path,
+						"send", n,
+					)
+				}
+			} else {
+				// お仕事やり直し
+				hh.worker.toTask(hh.tasks, t.Id)
+				http.Error(w, "お仕事のjsonエンコードに失敗しました。", http.StatusInternalServerError)
+				log.Infow("お仕事のjsonエンコードに失敗しました。",
+					"error", err,
+					"path", r.URL.Path,
+					"size", tt.Size,
+					"name", tt.Name,
+				)
+			}
+		} else {
+			// お仕事はない
+			http.NotFound(w, r)
+			log.Infow("仕事がありません。",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
+		}
+	default:
+		http.Error(w, "GET以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+		log.Infow("対応していないメソッドです。",
+			"path", r.URL.Path,
+			"method", r.Method,
+		)
+	}
+}
+func (hh *himawariTaskDoneHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// お仕事完了
+	if r.Method == "POST" {
+		err := hh.done(r)
+		if err == nil {
+			// 本当に完了
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+		} else {
+			// 完了に失敗
+			// やり直し判断は定期処理に任せる
+			http.Error(w, "なんか失敗しました。", http.StatusInternalServerError)
+		}
+	} else {
+		http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+		log.Infow("対応していないメソッドです。",
+			"path", r.URL.Path,
+			"method", r.Method,
+		)
+	}
+}
+func (hh *himawariTaskDataSendHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p := path.Clean(r.URL.Path)
 	if strings.Index(p, "/video/id/") == 0 {
 		if r.Method == "GET" {
-			wo, err := hh.worker.Get(p[10:])
+			wo, err := hh.worker.get(p[10:])
 			if err == nil {
 				rfp, err := os.Open(wo.Task.rp)
 				if err == nil {
@@ -195,145 +493,37 @@ func (hh *himawariHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "GET以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
 			log.Infow("対応していないメソッドです。", "path", r.URL.Path, "method", r.Method)
 		}
-	} else if p == "/task" {
-		// お仕事
-		switch r.Method {
-		case "GET":
-			// お仕事を得る
-			t := hh.taskToWorker(r)
-			if t != nil {
-				tt := struct {
-					Task
-					PresetData string
-					Command    string
-					Args       []string
-				}{
-					Task:       *t,
-					PresetData: PRESET_DATA,
-					Command:    "ffmpeg",
-					Args: []string{
-						"-y",
-						"-i", fmt.Sprintf("http://%s:%d/video/id/%s", serverIP, HTTP_PORT, t.Id),
-						"-threads", strconv.FormatInt(getHeaderDec(r, "X-Himawari-Threads", ENCODE_THREADS), 10),
-						"-vcodec", "libx265",
-						"-acodec", "aac", // libfdk_aac
-						"-ar", "48000",
-						"-ab", "128k",
-						"-r", "30000/1001",
-						"-s", "1280x720",
-						"-vsync", "1",
-						"-deinterlace",
-						"-pix_fmt", "yuv420p",
-						"-f", "mp4",
-						"-bufsize", "200000k",
-						"-maxrate", "2000k",
-					},
-				}
-				buf := bytes.Buffer{}
-				err := json.NewEncoder(&buf).Encode(&tt)
-				if err == nil {
-					w.Header().Set("Content-Type", "application/json; charset=utf-8")
-					w.Header().Set("X-Content-Type-Options", "nosniff")
-					w.WriteHeader(http.StatusOK)
-					n, err := buf.WriteTo(w)
-					if err != nil {
-						log.Infow("お仕事の転送に失敗しました。",
-							"error", err,
-							"path", r.URL.Path,
-							"size", tt.Size,
-							"name", tt.Name,
-						)
-					} else {
-						log.Infow("お仕事の転送に成功しました。",
-							"path", r.URL.Path,
-							"send", n,
-						)
-					}
-				} else {
-					// お仕事やり直し
-					hh.workerToTask(t.Id)
-					http.Error(w, "お仕事のjsonエンコードに失敗しました。", http.StatusInternalServerError)
-					log.Infow("お仕事のjsonエンコードに失敗しました。",
-						"error", err,
-						"path", r.URL.Path,
-						"size", tt.Size,
-						"name", tt.Name,
-					)
-				}
-			} else {
-				// お仕事はない
-				http.NotFound(w, r)
-				log.Infow("仕事がありません。",
-					"path", r.URL.Path,
-					"method", r.Method,
-				)
-			}
-		default:
-			http.Error(w, "GET、POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.Infow("対応していないメソッドです。",
-				"path", r.URL.Path,
-				"method", r.Method,
-			)
-		}
-	} else if p == "/task/add" {
-		// お仕事を追加する
-		if r.Method == "POST" {
-			stat, err := os.Stat(filepath.Join(RAW_PATH, r.PostFormValue("filename")))
-			if err == nil {
-				t := NewTask(stat)
-				if t != nil {
-					// 追加
-					hh.tasks.Add(t)
-				} else {
-					// 失敗しても特にエラーではない
-				}
-				w.WriteHeader(http.StatusOK)
-			} else {
-				http.Error(w, "リクエストされたファイルが存在しないようです。", http.StatusBadRequest)
-			}
-		} else {
-			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.Infow("対応していないメソッドです。",
-				"path", r.URL.Path,
-				"method", r.Method,
-			)
-		}
-	} else if p == "/task/done" {
-		// お仕事完了
-		if r.Method == "POST" {
-			err := hh.done(r)
-			if err == nil {
-				// 本当に完了
-				w.Header().Set("Content-Type", "text/html; charset=utf-8")
-				w.WriteHeader(http.StatusOK)
-			} else {
-				// 完了に失敗
-				// やり直し判断は定期処理に任せる
-				http.Error(w, "なんか失敗しました。", http.StatusInternalServerError)
-			}
-		} else {
-			http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
-			log.Infow("対応していないメソッドです。",
-				"path", r.URL.Path,
-				"method", r.Method,
-			)
-		}
-	} else if strings.Index(p, "/task/id/") == 0 {
-		// 実装は後で
-		http.NotFound(w, r)
-	} else if p == "/" || p == "/index.html" {
-		// トップページの表示
-		hh.dashboard(w, r)
-	} else {
-		// ファイルサーバにお任せ
-		hh.file.ServeHTTP(w, r)
 	}
 }
-
-func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
-	tall, _ := hh.tasks.All()
-	wall, _ := hh.worker.All()
-	call, _ := hh.completed.All()
+func (hh *himawariTaskAddHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// お仕事を追加する
+	if r.Method == "POST" {
+		stat, err := os.Stat(filepath.Join(RAW_PATH, r.PostFormValue("filename")))
+		if err == nil {
+			t := newTask(stat)
+			if t != nil {
+				// 追加
+				hh.tasks.add(t)
+			} else {
+				// 失敗しても特にエラーではない
+			}
+			w.WriteHeader(http.StatusOK)
+		} else {
+			http.Error(w, "リクエストされたファイルが存在しないようです。", http.StatusBadRequest)
+		}
+	} else {
+		http.Error(w, "POST以外のメソッドには対応していません。", http.StatusMethodNotAllowed)
+		log.Infow("対応していないメソッドです。",
+			"path", r.URL.Path,
+			"method", r.Method,
+		)
+	}
+}
+func (hh *himawariDashboardHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// トップページの表示
+	tall, _ := hh.tasks.all()
+	wall, _ := hh.worker.all()
+	call, _ := hh.completed.all()
 	db := Dashboard{
 		Tasks:     tall,
 		Worker:    wall,
@@ -356,10 +546,10 @@ func (hh *himawariHandle) dashboard(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (hh *himawariHandle) done(r *http.Request) error {
+func (hh *himawariTaskDoneHandle) done(r *http.Request) error {
 	id := r.PostFormValue("uuid")
 
-	wo, err := hh.worker.Get(id)
+	wo, err := hh.worker.get(id)
 	if err != nil {
 		return errors.New("仕事が無い")
 	}
@@ -403,9 +593,9 @@ func (hh *himawariHandle) done(r *http.Request) error {
 	wo.End = time.Now()
 
 	// お仕事完了
-	hh.worker.Del(id)
+	hh.worker.del(id)
 	// お仕事完了リストに追加
-	hh.completed.Add(wo)
+	hh.completed.add(wo)
 	log.Infow("お仕事が完遂されました。",
 		"size", wo.Task.Size,
 		"name", wo.Task.Name,
@@ -422,18 +612,33 @@ func (hh *himawariHandle) done(r *http.Request) error {
 	return nil
 }
 
-func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
+func (ht *himawariTask) addAll() error {
+	dir, err := ioutil.ReadDir(RAW_PATH)
+	if err != nil {
+		return err
+	}
+	// タスク生成
+	for _, it := range dir {
+		t := newTask(it)
+		if t != nil {
+			ht.add(t)
+		}
+	}
+	return nil
+}
+
+func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskItem {
 	rh, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
 		rh = r.RemoteAddr
 	}
-	wo := Worker{
+	wo := WorkerItem{
 		Host:  rh,
 		Start: time.Now(),
 	}
-	var t *Task
+	var t *TaskItem
 	for {
-		t, err = hh.tasks.Pop()
+		t, err = ht.pop()
 		if err != nil {
 			// タスクが空
 			break
@@ -448,7 +653,7 @@ func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
 			continue
 		}
 		wo.Task = t
-		hh.worker.Add(t.Id, wo)
+		worker.add(t.Id, wo)
 		log.Infow("お仕事が開始されました。",
 			"size", wo.Task.Size,
 			"name", wo.Task.Name,
@@ -460,16 +665,16 @@ func (hh *himawariHandle) taskToWorker(r *http.Request) *Task {
 	return t
 }
 
-func (hh *himawariHandle) workerToTask(idlist ...string) {
+func (hw *himawariWorker) toTask(tasks *himawariTask, idlist ...string) {
 	for _, id := range idlist {
-		wo, err := hh.worker.Get(id)
+		wo, err := hw.get(id)
 		if err != nil {
 			continue
 		}
 		// 新しいUUIDにする
-		wo.Task.Id = NewUUID()
-		hh.worker.Del(id)
-		hh.tasks.Add(wo.Task)
+		wo.Task.Id = newUUID()
+		hw.del(id)
+		tasks.add(wo.Task)
 		log.Infow("仕事をタスクリストに戻しました。",
 			"size", wo.Task.Size,
 			"name", wo.Task.Name,
@@ -478,146 +683,140 @@ func (hh *himawariHandle) workerToTask(idlist ...string) {
 	}
 }
 
-func NewUUID() string {
+func newUUID() string {
 	return uuid.New().String()
 }
 
-func NewHimawari() *himawariHandle {
-	dir, err := ioutil.ReadDir(RAW_PATH)
-	if err != nil {
-		log.Warn("RAW_PATHの読み込みに失敗しました。", err)
-		return nil
+func (hi *himawari) NewHimawariTask(ctx context.Context) *himawariTask {
+	allc := make(chan himawariTaskAllItem)
+	popc := make(chan himawariTaskPopItem)
+	addc := make(chan *TaskItem, 4)
+	ht := &himawariTask{
+		allc: allc,
+		popc: popc,
+		addc: addc,
 	}
-
-	hh := &himawariHandle{}
-	hh.file = http.FileServer(http.Dir(HTTP_DIR))
-	hh.tasks = func() himawariTask {
-		allc := make(chan himawariTaskAllItem)
-		popc := make(chan himawariTaskPopItem)
-		addc := make(chan *Task, 4)
-		go func() {
-			data := make([]*Task, 0, 16)
-			for {
-				select {
-				case item := <-allc:
-					datacopy := make([]*Task, len(data))
-					copy(datacopy, data)
-					item.ch <- datacopy
-				case item := <-popc:
-					if len(data) > 0 {
-						item.ch <- data[0]
-						data = data[1:]
-					} else {
-						close(item.ch)
-					}
-				case t := <-addc:
-					data = append(data, t)
+	hi.wg.Add(1)
+	go func() {
+		defer hi.wg.Done()
+		data := make([]*TaskItem, 0, 16)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case item := <-allc:
+				datacopy := make([]*TaskItem, len(data))
+				copy(datacopy, data)
+				item.ch <- datacopy
+			case item := <-popc:
+				if len(data) > 0 {
+					item.ch <- data[0]
+					data = data[1:]
+				} else {
+					close(item.ch)
 				}
+			case t := <-addc:
+				data = append(data, t)
 			}
-		}()
-		return himawariTask{
-			all: allc,
-			pop: popc,
-			add: addc,
 		}
 	}()
-	hh.worker = func() himawariWorker {
-		allc := make(chan himawariWorkerAllItem)
-		addc := make(chan himawariWorkerAddItem, 4)
-		delc := make(chan string, 4)
-		getc := make(chan himawariWorkerGetItem)
-		go func() {
-			tic := time.NewTicker(WORKER_CHECK_DURATION)
-			data := make(map[string]Worker)
-			for {
-				select {
-				case item := <-allc:
-					datacopy := make(map[string]Worker)
-					for k, v := range data {
-						datacopy[k] = v
-					}
-					item.ch <- datacopy
-				case item := <-addc:
-					data[item.id] = item.w
-				case id := <-delc:
-					delete(data, id)
-				case item := <-getc:
-					w, ok := data[item.id]
-					if ok {
-						item.ch <- w
-					} else {
-						close(item.ch)
-					}
-				case now := <-tic.C:
-					idlist := []string{}
-					for key, it := range data {
-						if now.After(it.Start.Add(WORKER_DELETE_DURATION)) {
-							idlist = append(idlist, key)
-						}
-					}
-					// goroutine使わないとデッドロックする
-					go hh.workerToTask(idlist...)
-				}
-			}
-		}()
-		return himawariWorker{
-			all: allc,
-			add: addc,
-			del: delc,
-			get: getc,
-		}
-	}()
-	hh.completed = func() himawariComplete {
-		allc := make(chan himawariCompleteAllItem)
-		addc := make(chan Worker)
-		go func() {
-			tic := time.NewTicker(WORKER_CHECK_DURATION)
-			data := make([]Worker, 0, 16)
-			for {
-				select {
-				case item := <-allc:
-					datacopy := make([]Worker, len(data))
-					copy(datacopy, data)
-					item.ch <- datacopy
-				case w := <-addc:
-					data = append(data, w)
-				case now := <-tic.C:
-					var i int
-					for i = len(data) - 1; i >= 0; i-- {
-						if now.After(data[i].End.Add(COMPLETED_DELETE_DURATION)) {
-							break
-						}
-					}
-					if i >= 0 {
-						data = data[i+1:]
-						log.Infow("完了リストの定期清掃を実施しました。", "count", i)
-					}
-				}
-			}
-		}()
-		return himawariComplete{
-			all: allc,
-			add: addc,
-		}
-	}()
-
-	for _, it := range dir {
-		t := NewTask(it)
-		if t != nil {
-			hh.tasks.Add(t)
-		}
-	}
-	thumbChan := make(chan Thumbnail, 256)
-	hh.thumbc = thumbChan
-	go thumbnailcycle(thumbChan)
-	go thumbnailstart(thumbChan)
-
-	return hh
+	return ht
 }
 
-func (ht himawariTask) All() ([]*Task, error) {
-	ch := make(chan []*Task)
-	ht.all <- himawariTaskAllItem{
+func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) *himawariWorker {
+	allc := make(chan himawariWorkerAllItem)
+	addc := make(chan himawariWorkerAddItem, 4)
+	delc := make(chan string, 4)
+	getc := make(chan himawariWorkerGetItem)
+	hw := &himawariWorker{
+		allc: allc,
+		addc: addc,
+		delc: delc,
+		getc: getc,
+	}
+	hi.wg.Add(1)
+	go func() {
+		defer hi.wg.Done()
+		tic := time.NewTicker(WORKER_CHECK_DURATION)
+		data := make(map[string]WorkerItem)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case item := <-allc:
+				datacopy := make(map[string]WorkerItem)
+				for k, v := range data {
+					datacopy[k] = v
+				}
+				item.ch <- datacopy
+			case item := <-addc:
+				data[item.id] = item.w
+			case id := <-delc:
+				delete(data, id)
+			case item := <-getc:
+				w, ok := data[item.id]
+				if ok {
+					item.ch <- w
+				} else {
+					close(item.ch)
+				}
+			case now := <-tic.C:
+				idlist := []string{}
+				for key, it := range data {
+					if now.After(it.Start.Add(WORKER_DELETE_DURATION)) {
+						idlist = append(idlist, key)
+					}
+				}
+				// goroutine使わないとデッドロックする
+				go hw.toTask(tasks, idlist...)
+			}
+		}
+	}()
+	return hw
+}
+
+func (hi *himawari) NewHimawariCompleted(ctx context.Context) *himawariComplete {
+	allc := make(chan himawariCompleteAllItem)
+	addc := make(chan WorkerItem)
+	hc := &himawariComplete{
+		allc: allc,
+		addc: addc,
+	}
+	hi.wg.Add(1)
+	go func() {
+		defer hi.wg.Done()
+		tic := time.NewTicker(WORKER_CHECK_DURATION)
+		data := make([]WorkerItem, 0, 16)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case item := <-allc:
+				datacopy := make([]WorkerItem, len(data))
+				copy(datacopy, data)
+				item.ch <- datacopy
+			case w := <-addc:
+				data = append(data, w)
+			case now := <-tic.C:
+				var i int
+				for i = len(data) - 1; i >= 0; i-- {
+					if now.After(data[i].End.Add(COMPLETED_DELETE_DURATION)) {
+						break
+					}
+				}
+				if i >= 0 {
+					data = data[i+1:]
+					log.Infow("完了リストの定期清掃を実施しました。", "count", i)
+				}
+			}
+		}
+	}()
+	return hc
+}
+
+func (ht himawariTask) all() ([]*TaskItem, error) {
+	ch := make(chan []*TaskItem)
+	ht.allc <- himawariTaskAllItem{
 		ch: ch,
 	}
 	tl, ok := <-ch
@@ -627,9 +826,9 @@ func (ht himawariTask) All() ([]*Task, error) {
 	return tl, nil
 }
 
-func (ht himawariTask) Pop() (*Task, error) {
-	ch := make(chan *Task)
-	ht.pop <- himawariTaskPopItem{
+func (ht himawariTask) pop() (*TaskItem, error) {
+	ch := make(chan *TaskItem)
+	ht.popc <- himawariTaskPopItem{
 		ch: ch,
 	}
 	t, ok := <-ch
@@ -639,13 +838,13 @@ func (ht himawariTask) Pop() (*Task, error) {
 	return t, nil
 }
 
-func (ht himawariTask) Add(t *Task) {
-	ht.add <- t
+func (ht himawariTask) add(t *TaskItem) {
+	ht.addc <- t
 }
 
-func (hw himawariWorker) All() (map[string]Worker, error) {
-	ch := make(chan map[string]Worker)
-	hw.all <- himawariWorkerAllItem{
+func (hw himawariWorker) all() (map[string]WorkerItem, error) {
+	ch := make(chan map[string]WorkerItem)
+	hw.allc <- himawariWorkerAllItem{
 		ch: ch,
 	}
 	mw, ok := <-ch
@@ -655,20 +854,20 @@ func (hw himawariWorker) All() (map[string]Worker, error) {
 	return mw, nil
 }
 
-func (hw himawariWorker) Add(id string, wo Worker) {
-	hw.add <- himawariWorkerAddItem{
+func (hw himawariWorker) add(id string, wo WorkerItem) {
+	hw.addc <- himawariWorkerAddItem{
 		id: id,
 		w:  wo,
 	}
 }
 
-func (hw himawariWorker) Del(id string) {
-	hw.del <- id
+func (hw himawariWorker) del(id string) {
+	hw.delc <- id
 }
 
-func (hw himawariWorker) Get(id string) (Worker, error) {
-	ch := make(chan Worker)
-	hw.get <- himawariWorkerGetItem{
+func (hw himawariWorker) get(id string) (WorkerItem, error) {
+	ch := make(chan WorkerItem)
+	hw.getc <- himawariWorkerGetItem{
 		id: id,
 		ch: ch,
 	}
@@ -679,9 +878,9 @@ func (hw himawariWorker) Get(id string) (Worker, error) {
 	return w, nil
 }
 
-func (hc himawariComplete) All() ([]Worker, error) {
-	ch := make(chan []Worker)
-	hc.all <- himawariCompleteAllItem{
+func (hc himawariComplete) all() ([]WorkerItem, error) {
+	ch := make(chan []WorkerItem)
+	hc.allc <- himawariCompleteAllItem{
 		ch: ch,
 	}
 	wl, ok := <-ch
@@ -691,11 +890,12 @@ func (hc himawariComplete) All() ([]Worker, error) {
 	return wl, nil
 }
 
-func (hc himawariComplete) Add(wo Worker) {
-	hc.add <- wo
+func (hc himawariComplete) add(wo WorkerItem) {
+	hc.addc <- wo
 }
 
-func thumbnailstart(tc chan<- Thumbnail) {
+func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
+	defer hi.wg.Done()
 	catelist, err := ioutil.ReadDir(ENCODED_PATH)
 	if err != nil {
 		return
@@ -704,8 +904,8 @@ func thumbnailstart(tc chan<- Thumbnail) {
 		if cate.IsDir() == false {
 			continue
 		}
-		cate_path := filepath.Join(ENCODED_PATH, cate.Name())
-		titlelist, err := ioutil.ReadDir(cate_path)
+		catepath := filepath.Join(ENCODED_PATH, cate.Name())
+		titlelist, err := ioutil.ReadDir(catepath)
 		if err != nil {
 			continue
 		}
@@ -713,8 +913,8 @@ func thumbnailstart(tc chan<- Thumbnail) {
 			if cate.IsDir() == false {
 				continue
 			}
-			title_path := filepath.Join(cate_path, title.Name())
-			stlist, err := ioutil.ReadDir(title_path)
+			titlepath := filepath.Join(catepath, title.Name())
+			stlist, err := ioutil.ReadDir(titlepath)
 			if err != nil {
 				continue
 			}
@@ -722,21 +922,21 @@ func thumbnailstart(tc chan<- Thumbnail) {
 				if st.IsDir() {
 					continue
 				}
-				st_path := filepath.Join(title_path, st.Name())
-				tdir, subtitle := filepath.Split(st_path)
+				stpath := filepath.Join(titlepath, st.Name())
+				tdir, subtitle := filepath.Split(stpath)
 				cdir, title := filepath.Split(filepath.Dir(tdir))
 				_, category := filepath.Split(filepath.Dir(cdir))
 				tp := filepath.Join(THUMBNAIL_PATH, category, title, strings.TrimSuffix(subtitle, filepath.Ext(subtitle)))
 				if isExist(tp) {
 					continue
 				}
-				d := getMovieDuration(st_path)
+				d := getMovieDuration(stpath)
 				if d == 0 {
 					continue
 				}
 				tc <- Thumbnail{
 					d:  d,
-					ep: st_path,
+					ep: stpath,
 					tp: tp,
 				}
 			}
@@ -744,7 +944,8 @@ func thumbnailstart(tc chan<- Thumbnail) {
 	}
 }
 
-func thumbnailcycle(tc <-chan Thumbnail) {
+func (hi *himawari) thumbnailcycle(ctx context.Context, tc <-chan Thumbnail) {
+	defer hi.wg.Done()
 	sy := make(chan struct{}, 8)
 	for t := range tc {
 		if isExist(t.tp) {
@@ -759,9 +960,11 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 		var i int64
 		for i = 0; i <= count; i++ {
 			sy <- struct{}{}
+			hi.wg.Add(1)
 			go func(t Thumbnail, i int64) {
 				defer func() {
 					<-sy
+					hi.wg.Done()
 				}()
 				err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
 				if err != nil {
@@ -786,12 +989,12 @@ func thumbnailcycle(tc <-chan Thumbnail) {
 	}
 }
 
-func NewTask(it os.FileInfo) *Task {
+func newTask(it os.FileInfo) *TaskItem {
 	if it.IsDir() {
 		return nil
 	}
-	t := &Task{
-		Id:   NewUUID(),
+	t := &TaskItem{
+		Id:   newUUID(),
 		Size: it.Size(),
 		Name: it.Name(),
 	}
@@ -805,8 +1008,8 @@ func NewTask(it os.FileInfo) *Task {
 	t.Category = namearr[2]
 
 	// フォルダ作成
-	category_path := filepath.Join(ENCODED_PATH, t.Category)
-	cerr := os.MkdirAll(category_path, 0755)
+	cp := filepath.Join(ENCODED_PATH, t.Category)
+	cerr := os.MkdirAll(cp, 0755)
 	if cerr != nil {
 		log.Warnw("カテゴリフォルダ作成に失敗しました。",
 			"name", t.Name,
@@ -816,11 +1019,11 @@ func NewTask(it os.FileInfo) *Task {
 	}
 
 	// 同じような名前を検索
-	t.Title = likeTitle(namearr[6], category_path)
+	t.Title = likeTitle(namearr[6], cp)
 
 	// 作品のフォルダを作る
-	title_path := filepath.Join(category_path, t.Title)
-	terr := os.MkdirAll(title_path, 0755)
+	tp := filepath.Join(cp, t.Title)
+	terr := os.MkdirAll(tp, 0755)
 	if terr != nil {
 		log.Warnw("作品フォルダ作成に失敗しました。",
 			"name", t.Name,
@@ -829,18 +1032,18 @@ func NewTask(it os.FileInfo) *Task {
 		return nil
 	}
 	// 同じ名前ならエンコードを省略
-	enc_name := namearr[6]
+	ename := namearr[6]
 	if namearr[7] != "" {
-		enc_name += "_" + namearr[7]
+		ename += "_" + namearr[7]
 	}
 	if namearr[8] != "" && namearr[8] != "n" {
-		enc_name += "_" + namearr[8]
+		ename += "_" + namearr[8]
 	}
-	t.Subtitle = enc_name
-	enc_name += ".mp4"
+	t.Subtitle = ename
+	ename += ".mp4"
 	t.rp = filepath.Join(RAW_PATH, t.Name)
 	t.dp = filepath.Join(DELETE_PATH, t.Name)
-	t.ep = filepath.Join(title_path, enc_name)
+	t.ep = filepath.Join(tp, ename)
 	t.tp = filepath.Join(THUMBNAIL_PATH, t.Category, t.Title, t.Subtitle)
 	if isExist(t.ep) {
 		// エンコード後ファイルが存在するのでスキップ
