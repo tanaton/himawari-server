@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -402,35 +401,24 @@ func (hh *himawariTaskStartHandle) ServeHTTP(w http.ResponseWriter, r *http.Requ
 					"-maxrate", "2000k",
 				},
 			}
-			buf := bytes.Buffer{}
-			err := json.NewEncoder(&buf).Encode(&tt)
-			if err == nil {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.Header().Set("X-Content-Type-Options", "nosniff")
-				w.WriteHeader(http.StatusOK)
-				n, err := buf.WriteTo(w)
-				if err != nil {
-					log.Infow("お仕事の転送に失敗しました。",
-						"error", err,
-						"path", r.URL.Path,
-						"size", tt.Size,
-						"name", tt.Name,
-					)
-				} else {
-					log.Infow("お仕事の転送に成功しました。",
-						"path", r.URL.Path,
-						"send", n,
-					)
-				}
-			} else {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.WriteHeader(http.StatusOK)
+			err := json.NewEncoder(w).Encode(&tt)
+			if err != nil {
 				// お仕事やり直し
 				hh.worker.toTask(hh.tasks, t.Id)
-				http.Error(w, "お仕事のjsonエンコードに失敗しました。", http.StatusInternalServerError)
-				log.Infow("お仕事のjsonエンコードに失敗しました。",
+				log.Infow("お仕事の転送に失敗しました。",
 					"error", err,
+					"id", t.Id,
 					"path", r.URL.Path,
 					"size", tt.Size,
 					"name", tt.Name,
+				)
+			} else {
+				log.Infow("お仕事の転送に成功しました。",
+					"id", t.Id,
+					"path", r.URL.Path,
 				)
 			}
 		} else {
@@ -633,10 +621,6 @@ func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskI
 	if err != nil {
 		rh = r.RemoteAddr
 	}
-	wo := WorkerItem{
-		Host:  rh,
-		Start: time.Now(),
-	}
 	var t *TaskItem
 	for {
 		t, err = ht.pop()
@@ -652,6 +636,10 @@ func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskI
 				"raw_path", t.rp,
 			)
 			continue
+		}
+		wo := WorkerItem{
+			Host:  rh,
+			Start: time.Now(),
 		}
 		wo.Task = t
 		worker.add(t.Id, wo)
