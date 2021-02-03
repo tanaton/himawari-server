@@ -631,6 +631,7 @@ func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskI
 		if isExist(t.ep) {
 			// エンコード後ファイルが存在するのでスキップ
 			log.Infow("すでにエンコードされている作品のようです。",
+				"id", t.Id,
 				"size", t.Size,
 				"name", t.Name,
 				"raw_path", t.rp,
@@ -644,6 +645,7 @@ func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskI
 		wo.Task = t
 		worker.add(t.Id, wo)
 		log.Infow("お仕事が開始されました。",
+			"id", t.Id,
 			"size", wo.Task.Size,
 			"name", wo.Task.Name,
 			"host", wo.Host,
