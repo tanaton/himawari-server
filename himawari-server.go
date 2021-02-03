@@ -703,6 +703,7 @@ func (hi *himawari) NewHimawariTask(ctx context.Context) *himawariTask {
 		for {
 			select {
 			case <-ctx.Done():
+				log.Infow("HimawariTask終了")
 				return
 			case item := <-allc:
 				datacopy := make([]*TaskItem, len(data))
@@ -742,6 +743,7 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 		for {
 			select {
 			case <-ctx.Done():
+				log.Infow("HimawariWorker終了")
 				return
 			case item := <-allc:
 				datacopy := make(map[string]WorkerItem)
@@ -790,6 +792,7 @@ func (hi *himawari) NewHimawariCompleted(ctx context.Context) *himawariComplete 
 		for {
 			select {
 			case <-ctx.Done():
+				log.Infow("HimawariCompleted終了")
 				return
 			case item := <-allc:
 				datacopy := make([]WorkerItem, len(data))
@@ -934,57 +937,65 @@ func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
 				if d == 0 {
 					continue
 				}
-				tc <- Thumbnail{
-					d:  d,
-					ep: stpath,
-					tp: tp,
+				select {
+				case <-ctx.Done():
+					log.Infow("thumbnailstart終了")
+					return
+				case tc <- Thumbnail{d: d, ep: stpath, tp: tp}:
 				}
 			}
 		}
 	}
+	log.Infow("サムネイルのまとめ作成完了")
 }
 
 func (hi *himawari) thumbnailcycle(ctx context.Context, tc <-chan Thumbnail) {
 	defer hi.wg.Done()
 	sy := make(chan struct{}, 8)
-	for t := range tc {
-		if isExist(t.tp) {
-			// 存在する場合はスルー
-			continue
-		}
-		if err := os.MkdirAll(t.tp, 0755); err != nil {
-			// フォルダ作成に失敗
-			continue
-		}
-		count := int64(t.d / (time.Second * THUMBNAIL_INTERVAL_DURATION))
-		var i int64
-		for i = 0; i <= count; i++ {
-			sy <- struct{}{}
-			hi.wg.Add(1)
-			go func(t Thumbnail, i int64) {
-				defer func() {
-					<-sy
-					hi.wg.Done()
-				}()
-				err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
-				if err != nil {
-					log.Warnw("サムネイルの作成に失敗しました。",
-						"encoded_path", t.ep,
-						"thumbnail_path", t.tp,
-						"duration", t.d,
-						"index", i,
-						"error", err,
-					)
-				}
-			}(t, i)
-		}
-		if i > count {
-			log.Infow("サムネイル作成完了",
-				"encoded_path", t.ep,
-				"thumbnail_path", t.tp,
-				"duration", t.d,
-				"count", count,
-			)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Infow("thumbnailcycle終了")
+			return
+		case t := <-tc:
+			if isExist(t.tp) {
+				// 存在する場合はスルー
+				continue
+			}
+			if err := os.MkdirAll(t.tp, 0755); err != nil {
+				// フォルダ作成に失敗
+				continue
+			}
+			count := int64(t.d / (time.Second * THUMBNAIL_INTERVAL_DURATION))
+			var i int64
+			for i = 0; i <= count; i++ {
+				sy <- struct{}{}
+				hi.wg.Add(1)
+				go func(t Thumbnail, i int64) {
+					defer func() {
+						<-sy
+						hi.wg.Done()
+					}()
+					err := createMovieThumbnail(t.ep, t.tp, i*THUMBNAIL_INTERVAL_DURATION)
+					if err != nil {
+						log.Warnw("サムネイルの作成に失敗しました。",
+							"encoded_path", t.ep,
+							"thumbnail_path", t.tp,
+							"duration", t.d,
+							"index", i,
+							"error", err,
+						)
+					}
+				}(t, i)
+			}
+			if i > count {
+				log.Infow("サムネイル作成完了",
+					"encoded_path", t.ep,
+					"thumbnail_path", t.tp,
+					"duration", t.d,
+					"count", count,
+				)
+			}
 		}
 	}
 }
