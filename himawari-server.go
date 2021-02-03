@@ -493,6 +493,12 @@ func (hh *himawariTaskAddHandle) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			if t != nil {
 				// 追加
 				hh.tasks.add(t)
+				log.Infow("新しいタスクを登録しました。",
+					"id", t.Id,
+					"size", t.Size,
+					"name", t.Name,
+					"raw_path", t.rp,
+				)
 			} else {
 				// 失敗しても特にエラーではない
 			}
@@ -611,6 +617,12 @@ func (ht *himawariTask) addAll() error {
 		t := newTask(it)
 		if t != nil {
 			ht.add(t)
+			log.Infow("新しいタスクを登録しました。",
+				"id", t.Id,
+				"size", t.Size,
+				"name", t.Name,
+				"raw_path", t.rp,
+			)
 		}
 	}
 	return nil
@@ -656,22 +668,27 @@ func (ht *himawariTask) toWorker(worker *himawariWorker, r *http.Request) *TaskI
 	return t
 }
 
-func (hw *himawariWorker) toTask(tasks *himawariTask, idlist ...string) {
-	for _, id := range idlist {
-		wo, err := hw.get(id)
-		if err != nil {
-			continue
-		}
-		// 新しいUUIDにする
-		wo.Task.Id = newUUID()
-		hw.del(id)
-		tasks.add(wo.Task)
-		log.Infow("仕事をタスクリストに戻しました。",
-			"size", wo.Task.Size,
-			"name", wo.Task.Name,
-			"start", wo.Start,
+func (hw *himawariWorker) toTask(tasks *himawariTask, id string) {
+	wo, err := hw.get(id)
+	if err != nil {
+		log.Infow("仕事からタスクへの移動に失敗しました。",
+			"error", err,
+			"id", id,
 		)
+		return
 	}
+	oldid := wo.Task.Id
+	// 新しいUUIDにする
+	wo.Task.Id = newUUID()
+	hw.del(id)
+	tasks.add(wo.Task)
+	log.Infow("仕事をタスクリストに戻しました。",
+		"id", wo.Task.Id,
+		"id_old", oldid,
+		"size", wo.Task.Size,
+		"name", wo.Task.Name,
+		"start", wo.Start,
+	)
 }
 
 func newUUID() string {
@@ -764,7 +781,9 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 				hi.wg.Add(1)
 				go func(idlist []string) {
 					defer hi.wg.Done()
-					hw.toTask(tasks, idlist...)
+					for _, id := range idlist {
+						hw.toTask(tasks, id)
+					}
 				}(idlist)
 			}
 		}
@@ -1060,11 +1079,6 @@ func newTask(it os.FileInfo) *TaskItem {
 		)
 		return nil
 	}
-	log.Infow("新しいタスクを登録しました。",
-		"size", t.Size,
-		"name", t.Name,
-		"raw_path", t.rp,
-	)
 	return t
 }
 
