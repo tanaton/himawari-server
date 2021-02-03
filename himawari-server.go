@@ -332,6 +332,7 @@ func (hi *himawari) shutdown(ctx context.Context, sl ...serverItem) error {
 	}
 	// サーバーの終了待機
 	hi.wg.Wait()
+	log.Infow("シャットダウン完了")
 	return log.Sync()
 }
 
@@ -770,7 +771,11 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 					}
 				}
 				// goroutine使わないとデッドロックする
-				go hw.toTask(tasks, idlist...)
+				hi.wg.Add(1)
+				go func(idlist []string) {
+					defer hi.wg.Done()
+					hw.toTask(tasks, idlist...)
+				}(idlist)
 			}
 		}
 	}()
