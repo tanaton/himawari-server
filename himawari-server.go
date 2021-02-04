@@ -493,13 +493,23 @@ func (hh *himawariTaskAddHandle) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			t := newTask(stat)
 			if t != nil {
 				// 追加
-				hh.tasks.add(r.Context(), t)
-				log.Infow("新しいタスクを登録しました。",
-					"id", t.Id,
-					"size", t.Size,
-					"name", t.Name,
-					"raw_path", t.rp,
-				)
+				err := hh.tasks.add(r.Context(), t)
+				if err != nil {
+					log.Warnw("タスクの登録に失敗しました。",
+						"error", err,
+						"id", t.Id,
+						"size", t.Size,
+						"name", t.Name,
+						"raw_path", t.rp,
+					)
+				} else {
+					log.Infow("新しいタスクを登録しました。",
+						"id", t.Id,
+						"size", t.Size,
+						"name", t.Name,
+						"raw_path", t.rp,
+					)
+				}
 			} else {
 				// 失敗しても特にエラーではない
 			}
@@ -594,9 +604,31 @@ func (hh *himawariTaskDoneHandle) done(r *http.Request) error {
 	wo.End = time.Now()
 
 	// お仕事完了
-	hh.worker.del(ctx, id)
+	err = hh.worker.del(ctx, id)
+	if err != nil {
+		log.Warnw("仕事の削除に失敗しました。",
+			"error", err,
+			"id", wo.Task.Id,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+		)
+		return err
+	}
 	// お仕事完了リストに追加
-	hh.completed.add(ctx, wo)
+	err = hh.completed.add(ctx, wo)
+	if err != nil {
+		log.Warnw("仕事の完了登録に失敗しました。",
+			"error", err,
+			"id", wo.Task.Id,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"host", wo.Host,
+			"start", wo.Start,
+		)
+		return err
+	}
 	log.Infow("お仕事が完遂されました。",
 		"id", wo.Task.Id,
 		"size", wo.Task.Size,
@@ -627,19 +659,29 @@ func (ht *himawariTask) addAll(ctx context.Context) error {
 	for _, it := range dir {
 		t := newTask(it)
 		if t != nil {
-			ht.add(ctx, t)
-			log.Infow("新しいタスクを登録しました。",
-				"id", t.Id,
-				"size", t.Size,
-				"name", t.Name,
-				"raw_path", t.rp,
-			)
+			err := ht.add(ctx, t)
+			if err != nil {
+				log.Warnw("タスクの登録に失敗しました。",
+					"error", err,
+					"id", t.Id,
+					"size", t.Size,
+					"name", t.Name,
+					"raw_path", t.rp,
+				)
+			} else {
+				log.Infow("新しいタスクを登録しました。",
+					"id", t.Id,
+					"size", t.Size,
+					"name", t.Name,
+					"raw_path", t.rp,
+				)
+			}
 		}
 	}
 	return nil
 }
 
-func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r *http.Request) *TaskItem {
+func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r *http.Request) (*TaskItem, error) {
 	rh, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err != nil {
 		rh = r.RemoteAddr
@@ -648,8 +690,7 @@ func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r 
 	for {
 		t, err = ht.pop(ctx)
 		if err != nil {
-			// タスクが空
-			break
+			return nil, errors.New("タスクが空です。")
 		}
 		if isExist(t.ep) {
 			// エンコード後ファイルが存在するのでスキップ
@@ -666,7 +707,19 @@ func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r 
 			Start: time.Now(),
 		}
 		wo.Task = t
-		worker.add(r.Context(), t.Id, wo)
+		err := worker.add(r.Context(), t.Id, wo)
+		if err != nil {
+			log.Warnw("仕事の開始に失敗しました。",
+				"error", err,
+				"id", t.Id,
+				"size", wo.Task.Size,
+				"name", wo.Task.Name,
+				"host", wo.Host,
+				"start", wo.Start,
+			)
+			// タスクはとりあえず捨てる
+			return nil, err
+		}
 		log.Infow("お仕事が開始されました。",
 			"id", t.Id,
 			"size", wo.Task.Size,
@@ -676,7 +729,7 @@ func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r 
 		)
 		break
 	}
-	return t
+	return t, nil
 }
 
 func (hw *himawariWorker) toTask(ctx context.Context, tasks *himawariTask, id string) {
@@ -691,8 +744,30 @@ func (hw *himawariWorker) toTask(ctx context.Context, tasks *himawariTask, id st
 	oldid := wo.Task.Id
 	// 新しいUUIDにする
 	wo.Task.Id = newUUID()
-	hw.del(ctx, id)
-	tasks.add(ctx, wo.Task)
+	err = hw.del(ctx, id)
+	if err != nil {
+		log.Warnw("仕事の削除に失敗しました。",
+			"error", err,
+			"id", wo.Task.Id,
+			"id_old", oldid,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"start", wo.Start,
+		)
+		return
+	}
+	err = tasks.add(ctx, wo.Task)
+	if err != nil {
+		log.Warnw("タスクの追加に失敗しました。",
+			"error", err,
+			"id", wo.Task.Id,
+			"id_old", oldid,
+			"size", wo.Task.Size,
+			"name", wo.Task.Name,
+			"start", wo.Start,
+		)
+		return
+	}
 	log.Infow("仕事をタスクリストに戻しました。",
 		"id", wo.Task.Id,
 		"id_old", oldid,
@@ -862,14 +937,14 @@ func (ht himawariTask) all(ctx context.Context) ([]*TaskItem, error) {
 	defer close(ch)
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case ht.allc <- himawariTaskAllItem{ch: ch}:
 	}
 	var tl []*TaskItem
 	var ok bool
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case tl, ok = <-ch:
 	}
 	if !ok {
@@ -883,14 +958,14 @@ func (ht himawariTask) pop(ctx context.Context) (*TaskItem, error) {
 	defer close(ch)
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case ht.popc <- himawariTaskPopItem{ch: ch}:
 	}
 	var t *TaskItem
 	var ok bool
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case t, ok = <-ch:
 	}
 	if !ok {
@@ -899,11 +974,13 @@ func (ht himawariTask) pop(ctx context.Context) (*TaskItem, error) {
 	return t, nil
 }
 
-func (ht himawariTask) add(ctx context.Context, t *TaskItem) {
+func (ht himawariTask) add(ctx context.Context, t *TaskItem) error {
 	select {
 	case <-ctx.Done():
+		return errors.New("Context close")
 	case ht.addc <- t:
 	}
+	return nil
 }
 
 func (hw himawariWorker) all(ctx context.Context) (map[string]WorkerItem, error) {
@@ -911,14 +988,14 @@ func (hw himawariWorker) all(ctx context.Context) (map[string]WorkerItem, error)
 	defer close(ch)
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case hw.allc <- himawariWorkerAllItem{ch: ch}:
 	}
 	var mw map[string]WorkerItem
 	var ok bool
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case mw, ok = <-ch:
 	}
 	if !ok {
@@ -927,18 +1004,22 @@ func (hw himawariWorker) all(ctx context.Context) (map[string]WorkerItem, error)
 	return mw, nil
 }
 
-func (hw himawariWorker) add(ctx context.Context, id string, wo WorkerItem) {
+func (hw himawariWorker) add(ctx context.Context, id string, wo WorkerItem) error {
 	select {
 	case <-ctx.Done():
+		return errors.New("Context close")
 	case hw.addc <- himawariWorkerAddItem{id: id, w: wo}:
 	}
+	return nil
 }
 
-func (hw himawariWorker) del(ctx context.Context, id string) {
+func (hw himawariWorker) del(ctx context.Context, id string) error {
 	select {
 	case <-ctx.Done():
+		return errors.New("Context close")
 	case hw.delc <- id:
 	}
+	return nil
 }
 
 func (hw himawariWorker) get(ctx context.Context, id string) (WorkerItem, error) {
@@ -948,12 +1029,12 @@ func (hw himawariWorker) get(ctx context.Context, id string) (WorkerItem, error)
 	var ok bool
 	select {
 	case <-ctx.Done():
-		return w, errors.New("panic")
+		return w, errors.New("Context close")
 	case hw.getc <- himawariWorkerGetItem{id: id, ch: ch}:
 	}
 	select {
 	case <-ctx.Done():
-		return w, errors.New("panic")
+		return w, errors.New("Context close")
 	case w, ok = <-ch:
 	}
 	if !ok {
@@ -967,14 +1048,14 @@ func (hc himawariComplete) all(ctx context.Context) ([]WorkerItem, error) {
 	defer close(ch)
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case hc.allc <- himawariCompleteAllItem{ch: ch}:
 	}
 	var wl []WorkerItem
 	var ok bool
 	select {
 	case <-ctx.Done():
-		return nil, errors.New("panic")
+		return nil, errors.New("Context close")
 	case wl, ok = <-ch:
 	}
 	if !ok {
@@ -983,11 +1064,13 @@ func (hc himawariComplete) all(ctx context.Context) ([]WorkerItem, error) {
 	return wl, nil
 }
 
-func (hc himawariComplete) add(ctx context.Context, wo WorkerItem) {
+func (hc himawariComplete) add(ctx context.Context, wo WorkerItem) error {
 	select {
 	case <-ctx.Done():
+		return errors.New("Context close")
 	case hc.addc <- wo:
 	}
+	return nil
 }
 
 func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
