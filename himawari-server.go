@@ -182,6 +182,7 @@ var gzipContentTypeList = []string{
 var regFilename = regexp.MustCompile(`^\[(\d{6}-\d{4})\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\]\[([^\]]+)\](.+?)_\[(.*?)\]_\[(.*?)\]\.m2ts$`)
 var serverIP string
 var log *zap.SugaredLogger
+var errTaskEmpty = errors.New("タスクが空です。")
 
 func init() {
 	logger, err := zap.NewProduction()
@@ -373,8 +374,8 @@ func (hh *himawariTaskStartHandle) ServeHTTP(w http.ResponseWriter, r *http.Requ
 	switch r.Method {
 	case "GET":
 		// お仕事を得る
-		t := hh.tasks.toWorker(ctx, hh.worker, r)
-		if t != nil {
+		t, err := hh.tasks.toWorker(ctx, hh.worker, r)
+		if err == nil {
 			tt := struct {
 				TaskItem
 				PresetData string
@@ -422,10 +423,17 @@ func (hh *himawariTaskStartHandle) ServeHTTP(w http.ResponseWriter, r *http.Requ
 					"path", r.URL.Path,
 				)
 			}
-		} else {
+		} else if err == errTaskEmpty {
 			// お仕事はない
 			http.NotFound(w, r)
 			log.Infow("仕事がありません。",
+				"path", r.URL.Path,
+				"method", r.Method,
+			)
+		} else {
+			http.Error(w, "なんか失敗しました。", http.StatusInternalServerError)
+			log.Warnw("chanによる仕事のやり取りに失敗しました。",
+				"error", err,
 				"path", r.URL.Path,
 				"method", r.Method,
 			)
@@ -690,7 +698,7 @@ func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r 
 	for {
 		t, err = ht.pop(ctx)
 		if err != nil {
-			return nil, errors.New("タスクが空です。")
+			return nil, errTaskEmpty
 		}
 		if isExist(t.ep) {
 			// エンコード後ファイルが存在するのでスキップ
