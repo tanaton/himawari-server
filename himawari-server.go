@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -223,8 +223,15 @@ func _main() int {
 }
 
 func (hi *himawari) run(bctx context.Context) error {
-	ctx, exitch := hi.startExitManageProc(bctx)
-
+	ctx, stop := signal.NotifyContext(bctx,
+		syscall.SIGHUP,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+		syscall.SIGQUIT,
+		os.Interrupt,
+		os.Kill,
+	)
+	defer stop()
 	thumbChan := make(chan Thumbnail, 256)
 	tasks := hi.NewHimawariTask(ctx)
 	worker := hi.NewHimawariWorker(ctx, tasks)
@@ -260,14 +267,14 @@ func (hi *himawari) run(bctx context.Context) error {
 
 	err := tasks.addAll(ctx)
 	if err != nil {
-		exitch <- struct{}{}
+		stop()
 		log.Infow("タスク追加に失敗しました。", "error", err)
 		return hi.shutdown(ctx)
 	}
 
 	ghfunc, err := gziphandler.GzipHandlerWithOpts(gziphandler.CompressionLevel(gzip.BestSpeed), gziphandler.ContentTypes(gzipContentTypeList))
 	if err != nil {
-		exitch <- struct{}{}
+		stop()
 		log.Infow("サーバーハンドラの作成に失敗しました。", "error", err)
 		return hi.shutdown(ctx)
 	}
@@ -312,14 +319,14 @@ func (hi *himawari) shutdown(ctx context.Context, sl ...serverItem) error {
 	// シグナル等でサーバを中断する
 	<-ctx.Done()
 	// シャットダウン処理用コンテキストの用意
-	sctx, scancel := context.WithCancel(context.Background())
-	defer scancel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	for _, srv := range sl {
 		hi.wg.Add(1)
 		go func(ctx context.Context, srv *http.Server) {
-			sctx, sscancel := context.WithTimeout(ctx, time.Second*10)
+			sctx, scancel := context.WithTimeout(ctx, time.Second*10)
 			defer func() {
-				sscancel()
+				scancel()
 				hi.wg.Done()
 			}()
 			err := srv.Shutdown(sctx)
@@ -328,44 +335,12 @@ func (hi *himawari) shutdown(ctx context.Context, sl ...serverItem) error {
 			} else {
 				log.Infow("サーバーの終了に成功しました。", "Addr", srv.Addr)
 			}
-		}(sctx, srv.s)
+		}(ctx, srv.s)
 	}
 	// サーバーの終了待機
 	hi.wg.Wait()
 	log.Infow("シャットダウン完了")
 	return log.Sync()
-}
-
-func (hi *himawari) startExitManageProc(ctx context.Context) (context.Context, chan<- struct{}) {
-	exitch := make(chan struct{}, 1)
-	ectx, cancel := context.WithCancel(ctx)
-	hi.wg.Add(1)
-	go func(ctx context.Context, ch <-chan struct{}) {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig,
-			syscall.SIGHUP,
-			syscall.SIGINT,
-			syscall.SIGTERM,
-			syscall.SIGQUIT,
-			os.Interrupt,
-			os.Kill,
-		)
-		defer func() {
-			signal.Stop(sig)
-			cancel()
-			hi.wg.Done()
-		}()
-
-		select {
-		case <-ctx.Done():
-			log.Infow("Cancel from parent")
-		case s := <-sig:
-			log.Infow("Signal!!", "signal", s)
-		case <-ch:
-			log.Infow("Exit command!!")
-		}
-	}(ectx, exitch)
-	return ectx, exitch
 }
 
 func (hh *himawariTaskStartHandle) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -659,12 +634,20 @@ func (hh *himawariTaskDoneHandle) done(r *http.Request) error {
 }
 
 func (ht *himawariTask) addAll(ctx context.Context) error {
-	dir, err := ioutil.ReadDir(RAW_PATH)
+	dir, err := os.ReadDir(RAW_PATH)
 	if err != nil {
 		return err
 	}
 	// タスク生成
-	for _, it := range dir {
+	for _, d := range dir {
+		it, err := d.Info()
+		if err != nil {
+			log.Warnw("ファイル情報の取得に失敗しました。",
+				"error", err,
+				"name", it.Name(),
+			)
+			continue
+		}
 		t := newTask(it)
 		if t != nil {
 			err := ht.add(ctx, t)
@@ -1083,7 +1066,7 @@ func (hc himawariComplete) add(ctx context.Context, wo WorkerItem) error {
 
 func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
 	defer hi.wg.Done()
-	catelist, err := ioutil.ReadDir(ENCODED_PATH)
+	catelist, err := os.ReadDir(ENCODED_PATH)
 	if err != nil {
 		return
 	}
@@ -1092,7 +1075,7 @@ func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
 			continue
 		}
 		catepath := filepath.Join(ENCODED_PATH, cate.Name())
-		titlelist, err := ioutil.ReadDir(catepath)
+		titlelist, err := os.ReadDir(catepath)
 		if err != nil {
 			continue
 		}
@@ -1101,7 +1084,7 @@ func (hi *himawari) thumbnailstart(ctx context.Context, tc chan<- Thumbnail) {
 				continue
 			}
 			titlepath := filepath.Join(catepath, title.Name())
-			stlist, err := ioutil.ReadDir(titlepath)
+			stlist, err := os.ReadDir(titlepath)
 			if err != nil {
 				continue
 			}
@@ -1184,7 +1167,7 @@ func (hi *himawari) thumbnailcycle(ctx context.Context, tc <-chan Thumbnail) {
 	}
 }
 
-func newTask(it os.FileInfo) *TaskItem {
+func newTask(it fs.FileInfo) *TaskItem {
 	if it.IsDir() {
 		return nil
 	}
@@ -1276,7 +1259,7 @@ func likeTitle(title, cp string) string {
 	// タイトルが短い場合は省略
 	strlen := len([]rune(title))
 	if strlen > 3 {
-		titlelist, err := ioutil.ReadDir(cp)
+		titlelist, err := os.ReadDir(cp)
 		if err != nil {
 			return title
 		}
