@@ -1327,7 +1327,11 @@ func getMovieDuration(ctx context.Context, p string) time.Duration {
 
 	var sbuf strings.Builder
 	cmd.Stderr = &sbuf
-	cmd.Run()
+	err := cmd.Run()
+	if err != nil {
+		log.Warnw("動画の長さを取得するためのffmpeg実行に失敗", "error", err)
+		return 0
+	}
 	str := sbuf.String()
 	index := strings.Index(str, "Duration: ")
 	if index < 0 || len(str) < index+18+5 {
