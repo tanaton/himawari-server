@@ -107,15 +107,15 @@ type himawariTask struct {
 }
 
 type himawariWorkerAllItem struct {
-	ch chan<- map[string]WorkerItem
+	ch chan<- map[string]*WorkerItem
 }
 type himawariWorkerAddItem struct {
 	id string
-	w  WorkerItem
+	w  *WorkerItem
 }
 type himawariWorkerGetItem struct {
 	id string
-	ch chan<- WorkerItem
+	ch chan<- *WorkerItem
 }
 type himawariWorker struct {
 	allc chan<- himawariWorkerAllItem
@@ -125,11 +125,11 @@ type himawariWorker struct {
 }
 
 type himawariCompleteAllItem struct {
-	ch chan<- []WorkerItem
+	ch chan<- []*WorkerItem
 }
 type himawariComplete struct {
 	allc chan<- himawariCompleteAllItem
-	addc chan<- WorkerItem
+	addc chan<- *WorkerItem
 }
 
 type himawariHandle struct {
@@ -141,8 +141,8 @@ type himawariHandle struct {
 }
 type Dashboard struct {
 	Tasks     []*TaskItem
-	Worker    map[string]WorkerItem
-	Completed []WorkerItem
+	Worker    map[string]*WorkerItem
+	Completed []*WorkerItem
 }
 type serverItem struct {
 	s *http.Server
@@ -209,21 +209,17 @@ func main() {
 }
 
 func _main() int {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		log.Sync()
-		cancel()
-	}()
+	defer log.Sync()
 
 	hi := himawari{}
-	if err := hi.run(ctx); err != nil {
+	if err := hi.run(context.Background()); err != nil {
 		return 1
 	}
 	return 0
 }
 
-func (hi *himawari) run(bctx context.Context) error {
-	ctx, stop := signal.NotifyContext(bctx,
+func (hi *himawari) run(ctx context.Context) error {
+	ctx, stop := signal.NotifyContext(ctx,
 		syscall.SIGHUP,
 		syscall.SIGINT,
 		syscall.SIGTERM,
@@ -537,8 +533,8 @@ func (hh *himawariDashboardHandle) ServeHTTP(w http.ResponseWriter, r *http.Requ
 }
 
 func (hh *himawariTaskDoneHandle) done(r *http.Request) error {
-	id := r.PostFormValue("uuid")
 	ctx := r.Context()
+	id := r.PostFormValue("uuid")
 
 	wo, err := hh.worker.get(ctx, id)
 	if err != nil {
@@ -693,7 +689,7 @@ func (ht *himawariTask) toWorker(ctx context.Context, worker *himawariWorker, r 
 			)
 			continue
 		}
-		wo := WorkerItem{
+		wo := &WorkerItem{
 			Host:  rh,
 			Start: time.Now(),
 		}
@@ -805,7 +801,10 @@ func (hi *himawari) NewHimawariTask(ctx context.Context) *himawariTask {
 					}
 					data = data[1:]
 				} else {
-					close(item.ch)
+					select {
+					case item.ch <- nil:
+					default:
+					}
 				}
 			case t := <-addc:
 				data = append(data, t)
@@ -830,14 +829,14 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 	go func() {
 		defer hi.wg.Done()
 		tic := time.NewTicker(WORKER_CHECK_DURATION)
-		data := make(map[string]WorkerItem)
+		data := make(map[string]*WorkerItem)
 		for {
 			select {
 			case <-ctx.Done():
 				log.Infow("HimawariWorker終了")
 				return
 			case item := <-allc:
-				datacopy := make(map[string]WorkerItem)
+				datacopy := make(map[string]*WorkerItem)
 				for k, v := range data {
 					datacopy[k] = v
 				}
@@ -857,7 +856,10 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 					default:
 					}
 				} else {
-					close(item.ch)
+					select {
+					case item.ch <- nil:
+					default:
+					}
 				}
 			case now := <-tic.C:
 				idlist := []string{}
@@ -882,7 +884,7 @@ func (hi *himawari) NewHimawariWorker(ctx context.Context, tasks *himawariTask) 
 
 func (hi *himawari) NewHimawariCompleted(ctx context.Context) *himawariComplete {
 	allc := make(chan himawariCompleteAllItem)
-	addc := make(chan WorkerItem)
+	addc := make(chan *WorkerItem)
 	hc := &himawariComplete{
 		allc: allc,
 		addc: addc,
@@ -891,14 +893,14 @@ func (hi *himawari) NewHimawariCompleted(ctx context.Context) *himawariComplete 
 	go func() {
 		defer hi.wg.Done()
 		tic := time.NewTicker(WORKER_CHECK_DURATION)
-		data := make([]WorkerItem, 0, 16)
+		data := make([]*WorkerItem, 0, 16)
 		for {
 			select {
 			case <-ctx.Done():
 				log.Infow("HimawariCompleted終了")
 				return
 			case item := <-allc:
-				datacopy := make([]WorkerItem, len(data))
+				datacopy := make([]*WorkerItem, len(data))
 				copy(datacopy, data)
 				select {
 				case item.ch <- datacopy:
@@ -925,44 +927,41 @@ func (hi *himawari) NewHimawariCompleted(ctx context.Context) *himawariComplete 
 
 func (ht himawariTask) all(ctx context.Context) ([]*TaskItem, error) {
 	ch := make(chan []*TaskItem, 1)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
 	defer close(ch)
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
 	case ht.allc <- himawariTaskAllItem{ch: ch}:
 	}
-	var tl []*TaskItem
-	var ok bool
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
-	case tl, ok = <-ch:
+	case tl := <-ch:
+		return tl, nil
 	}
-	if !ok {
-		return nil, errors.New("panic")
-	}
-	return tl, nil
 }
 
 func (ht himawariTask) pop(ctx context.Context) (*TaskItem, error) {
 	ch := make(chan *TaskItem, 1)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
 	defer close(ch)
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
 	case ht.popc <- himawariTaskPopItem{ch: ch}:
 	}
-	var t *TaskItem
-	var ok bool
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
-	case t, ok = <-ch:
+	case t := <-ch:
+		if t == nil {
+			return nil, errors.New("タスクリストが空でした。")
+		}
+		return t, nil
 	}
-	if !ok {
-		return nil, errors.New("タスクリストが空でした。")
-	}
-	return t, nil
 }
 
 func (ht himawariTask) add(ctx context.Context, t *TaskItem) error {
@@ -974,28 +973,25 @@ func (ht himawariTask) add(ctx context.Context, t *TaskItem) error {
 	return nil
 }
 
-func (hw himawariWorker) all(ctx context.Context) (map[string]WorkerItem, error) {
-	ch := make(chan map[string]WorkerItem, 1)
+func (hw himawariWorker) all(ctx context.Context) (map[string]*WorkerItem, error) {
+	ch := make(chan map[string]*WorkerItem, 1)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
 	defer close(ch)
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
 	case hw.allc <- himawariWorkerAllItem{ch: ch}:
 	}
-	var mw map[string]WorkerItem
-	var ok bool
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
-	case mw, ok = <-ch:
+	case mw := <-ch:
+		return mw, nil
 	}
-	if !ok {
-		return nil, errors.New("panic")
-	}
-	return mw, nil
 }
 
-func (hw himawariWorker) add(ctx context.Context, id string, wo WorkerItem) error {
+func (hw himawariWorker) add(ctx context.Context, id string, wo *WorkerItem) error {
 	select {
 	case <-ctx.Done():
 		return errors.New("Context close")
@@ -1013,49 +1009,46 @@ func (hw himawariWorker) del(ctx context.Context, id string) error {
 	return nil
 }
 
-func (hw himawariWorker) get(ctx context.Context, id string) (WorkerItem, error) {
-	ch := make(chan WorkerItem, 1)
+func (hw himawariWorker) get(ctx context.Context, id string) (*WorkerItem, error) {
+	ch := make(chan *WorkerItem, 1)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
 	defer close(ch)
-	var w WorkerItem
-	var ok bool
 	select {
 	case <-ctx.Done():
-		return w, errors.New("Context close")
+		return nil, errors.New("Context close")
 	case hw.getc <- himawariWorkerGetItem{id: id, ch: ch}:
 	}
 	select {
 	case <-ctx.Done():
-		return w, errors.New("Context close")
-	case w, ok = <-ch:
+		return nil, errors.New("Context close")
+	case w := <-ch:
+		if w == nil {
+			return nil, errors.New("Workerが見つかりませんでした。")
+		}
+		return w, nil
 	}
-	if !ok {
-		return w, errors.New("Workerが見つかりませんでした。")
-	}
-	return w, nil
 }
 
-func (hc himawariComplete) all(ctx context.Context) ([]WorkerItem, error) {
-	ch := make(chan []WorkerItem, 1)
+func (hc himawariComplete) all(ctx context.Context) ([]*WorkerItem, error) {
+	ch := make(chan []*WorkerItem, 1)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*3)
+	defer cancel()
 	defer close(ch)
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
 	case hc.allc <- himawariCompleteAllItem{ch: ch}:
 	}
-	var wl []WorkerItem
-	var ok bool
 	select {
 	case <-ctx.Done():
 		return nil, errors.New("Context close")
-	case wl, ok = <-ch:
+	case wl := <-ch:
+		return wl, nil
 	}
-	if !ok {
-		return nil, errors.New("panic")
-	}
-	return wl, nil
 }
 
-func (hc himawariComplete) add(ctx context.Context, wo WorkerItem) error {
+func (hc himawariComplete) add(ctx context.Context, wo *WorkerItem) error {
 	select {
 	case <-ctx.Done():
 		return errors.New("Context close")
@@ -1352,7 +1345,7 @@ func getMovieDuration(ctx context.Context, p string) time.Duration {
 }
 
 func createMovieThumbnail(ctx context.Context, ep, tp string, sec int64) error {
-	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 	defer cancel()
 	// ffmpegもffprobeもstderrに出力するのでffmpegを使っておく
 	args := []string{
