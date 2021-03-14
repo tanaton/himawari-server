@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -1315,33 +1316,36 @@ func getHeaderString(r *http.Request, key string, def string) (ret string) {
 func getMovieDuration(ctx context.Context, p string) time.Duration {
 	ctx, cancel := context.WithTimeout(ctx, time.Second*10)
 	defer cancel()
-	// ffmpegもffprobeもstderrに出力するのでffmpegを使っておく
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-i", p)
+	cmd := exec.CommandContext(ctx,
+		"ffprobe",
+		"-show_entries", "format=duration",
+		"-print_format", "json",
+		"-loglevel", "quiet",
+		"-i", p)
 
-	var sbuf strings.Builder
-	cmd.Stderr = &sbuf
+	var sbuf bytes.Buffer
+	cmd.Stdout = &sbuf
 	err := cmd.Run()
 	if err != nil {
-		log.Warnw("動画の長さを取得するためのffmpeg実行に失敗", "error", err)
+		log.Warnw("動画の長さを取得するためのffprobe実行に失敗", "error", err, "command", cmd.String())
 		return 0
 	}
-	str := sbuf.String()
-	index := strings.Index(str, "Duration: ")
-	if index < 0 || len(str) < index+18+5 {
+	var data struct {
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	err = json.NewDecoder(&sbuf).Decode(&data)
+	if err != nil {
+		log.Warnw("jsonのデコードに失敗", "error", err, "command", cmd.String())
 		return 0
 	}
-	arr := strings.Split(str[index+10:index+10+8], ":")
-	if len(arr) < 3 {
+	d, err := strconv.ParseFloat(data.Format.Duration, 64)
+	if err != nil {
+		log.Warnw("動画の秒数（文字列）の数値変換に失敗", "error", err, "command", cmd.String())
 		return 0
 	}
-	var d time.Duration
-	h, _ := strconv.ParseUint(arr[0], 10, 32)
-	m, _ := strconv.ParseUint(arr[1], 10, 32)
-	s, _ := strconv.ParseUint(arr[2], 10, 32)
-	d += time.Hour * time.Duration(h)
-	d += time.Minute * time.Duration(m)
-	d += time.Second * time.Duration(s)
-	return d
+	return time.Duration(d * float64(time.Second))
 }
 
 func createMovieThumbnail(ctx context.Context, ep, tp string, sec int64) error {
